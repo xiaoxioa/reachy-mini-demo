@@ -181,6 +181,28 @@ from reachy_mini import ReachyMini
 
 ---
 
+## 9. 本地视觉:MediaPipe 看脸 + 转头跟随(VIS-01)✅(2026-06-05)
+
+第一次引入本地视觉栈(与音频/Qwen 独立)。实现 `vision/vis01_face_track.py`(独立脚本,未接对话);诊断工具 `vision/_diag_face.py` / `_diag_face2.py`。
+
+### 环境与性能(本机实测)
+- **MediaPipe 0.10.35**(清华镜像装,Python 3.12 venv 直接可用;依赖带入 opencv-contrib 与 sounddevice——**照旧禁止开 `cv2.VideoCapture`/sounddevice 流**,只用其库代码)。
+- 模型:Face Landmarker `face_landmarker.task`(float16,3.7MB),放 `vision/models/`(gitignore)。下载:`https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`(实测大陆直连可下)。
+- **性能(640×360 输入,CPU/XNNPACK):端到端 41 FPS,单帧推理均值 12ms / P95 16ms**——这台机器跑实时视觉余量充足,后续可叠加更多模型。
+- 降采样:1080p 帧 `frame[::3, ::3, ::-1]` 整数抽样 + BGR→RGB,开销近零,优于 resize。
+
+### 跟随控制(闭环:摄像头在头上,转头即收敛)
+- 人脸中心 (u,v)(取最大脸 bbox 中心)→ One Euro 滤波(min_cutoff 0.8, beta 0.08)→ 角度误差 = (u−0.5)×FOV(FOV 估 65°×40°)→ **时间常数型 P 控制** → `set_target` 连续转头。
+- **⭐ 核心教训(首轮"一直点头"):** 按"每帧吃固定比例误差"设增益会随帧率缩放——47fps 下等效 ~190°/s,叠加摄像头管线 ~100ms 延迟 → pitch 在 ±15° 限位间持续打摆。**修复:`step = err × (1 − exp(−dt/TAU))`,TAU=0.4s,与帧率解耦**;另 MAX_STEP 1.5°/帧、死区 2°。修后用户确认平滑无抖、方向正确。
+- 方向映射(摄像头不镜像):画面右(u>0.5)= 机器人右边 → yaw 取负;画面下 → pitch 取正。跟随限幅 yaw ±25° / pitch ±15°。
+- 丢脸策略:保持 1.5s → 每帧 ×0.97 缓慢回中 → 重见即重新锁定;One Euro 丢脸时 reset(防跳变)。
+
+### 踩坑记录
+- **MediaPipe VIDEO 模式时间戳必须严格递增**:同一毫秒两帧会抛 "Input timestamp must be monotonically increasing";用 `ts = max(prev+1, 真实ms)` 防撞。
+- **零检出先怀疑画面再怀疑代码**:连续两轮 0% 检出,最后发现是机器人对着衣柜/人在画面边缘躺着侧脸。排查路径:存帧人工看 → 标准人脸图(mediapipe-assets portrait.jpg)验证安装 → 全尺寸帧重测。`vision/_diag_face2.py` 即此流程,可复用。
+
+---
+
 ## 体检汇总(2026-06-03)
 
 | 项 | 通道 | 结果 | 关键数据 |
@@ -200,3 +222,4 @@ from reachy_mini import ReachyMini
 | O-01a-1 动作工具(function calling) | 2026-06-05 | ✅ 8 工具,边说边动并发实测,见 §7 |
 | O-01a-2 idle 微动 + 幅度加大 + 同时出发 | 2026-06-05 | ✅ 微动让位 30ms,4/4 语音动作重叠,见 §7 |
 | V-01-1 take_snapshot 看图 | 2026-06-05 | ✅ 抓帧 47ms,看图 ~3s,口头过渡,见 §8 |
+| VIS-01 MediaPipe 看脸+转头跟随 | 2026-06-05 | ✅ 41FPS/12ms,时间常数控制平滑跟随,见 §9 |
