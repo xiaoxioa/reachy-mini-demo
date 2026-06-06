@@ -7,6 +7,9 @@ vision/debug/
 # 二进制模型(3.7MB,下载地址见 CALIBRATION.md §9)
 vision/models/
 
+# daemon 运行日志(本地排障用)
+tools/daemon_logs/
+
 # Python 缓存
 __pycache__/
 *.pyc
