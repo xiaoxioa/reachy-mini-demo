@@ -10,6 +10,12 @@ vision/models/
 # daemon 运行日志(本地排障用)
 tools/daemon_logs/
 
+# 唤醒词调研产物(KWS 模型 32MB / 测试 venv / 合成音频 / 脚本草稿)——留磁盘不进库
+tools/_kws*
+tools/sherpa-onnx-*/
+tools/kws_model.tar.bz2
+tools/err.txt
+
 # Python 缓存
 __pycache__/
 *.pyc
