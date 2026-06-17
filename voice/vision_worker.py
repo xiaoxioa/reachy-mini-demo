@@ -16,6 +16,7 @@ MediaPipe VIDEO 模式时间戳严格递增(CALIBRATION §9 坑)。
 """
 
 import math
+import os
 import time
 
 WRIST, IDX_MCP, IDX_PIP, IDX_TIP = 0, 5, 6, 8
@@ -24,9 +25,14 @@ HAND_NEAR_SCORE = 0.6  # "近手"双门:handedness score(真手>0.9,背景误检
 HAND_NEAR_SIZE = 0.22  # "近手"双门:bbox 最大边占画面比(逗它的手 0.5+,误检 0.06~0.15)
 HAND_BOOST_S = 2.0     # 见到近手后,这么多秒内手检测提频到每帧(跟手用)
 
+# ── M1.5-c sticky 选脸(跨帧粘滞,两张相近脸不再跳)──
+STICKY_MATCH_DIST = 0.18    # 匹配上帧脸的最大欧几里得距离(归一化坐标)
+STICKY_SWITCH_RATIO = 1.20  # 另一张脸 h > 当前 × ratio 才开始"切换压力"计数
+STICKY_SWITCH_FRAMES = 8    # 另一张脸连续 N 帧明显更大才真切(~0.3s@27fps)
+
 
 def pick_main_face(result):
-    """返回最大人脸的 (u, v, 高度占比);没有人脸返回 None。"""
+    """返回最大人脸的 (u, v, 高度占比);没有人脸返回 None。(无状态版,--no-sticky 回退用)"""
     if not result.face_landmarks:
         return None
     best = None
@@ -39,6 +45,69 @@ def pick_main_face(result):
             best_h = h
             best = ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0, h)
     return best
+
+
+class FaceSelector:
+    """M1.5-c 跨帧粘滞选脸:锁住一张脸就跟着,除非它消失或另一张持续明显更大。"""
+
+    def __init__(self, sticky: bool = True):
+        self._sticky = sticky
+        self._prev_u = None       # 上帧选中脸的中心 u
+        self._prev_v = None       # 上帧选中脸的中心 v
+        self._rival_count = 0     # 另一张脸"明显更大"连续帧计数
+
+    def reset(self):
+        """清除粘滞状态(切换对话对象时调用)。"""
+        self._prev_u = self._prev_v = None
+        self._rival_count = 0
+
+    def select(self, result) -> tuple | None:
+        """从 MediaPipe 结果选脸。返回 (u, v, h) 或 None。"""
+        if not result.face_landmarks:
+            self._prev_u = self._prev_v = None
+            self._rival_count = 0
+            return None
+
+        faces = []
+        for lms in result.face_landmarks:
+            xs = [p.x for p in lms]
+            ys = [p.y for p in lms]
+            h = max(ys) - min(ys)
+            u = (min(xs) + max(xs)) / 2.0
+            v = (min(ys) + max(ys)) / 2.0
+            faces.append((u, v, h))
+
+        if not self._sticky or len(faces) == 1 or self._prev_u is None:
+            best = max(faces, key=lambda f: f[2])
+            self._prev_u, self._prev_v = best[0], best[1]
+            self._rival_count = 0
+            return best
+
+        # 多脸 + 有前帧 → 找距离上帧最近的(粘住)
+        def _dist(f):
+            return math.hypot(f[0] - self._prev_u, f[1] - self._prev_v)
+
+        matched = min(faces, key=_dist)
+        if _dist(matched) > STICKY_MATCH_DIST:
+            # 所有脸都离上帧太远(人移走了?),退回 argmax
+            best = max(faces, key=lambda f: f[2])
+            self._prev_u, self._prev_v = best[0], best[1]
+            self._rival_count = 0
+            return best
+
+        # 检查是否有另一张脸持续明显更大(该切换了)
+        biggest = max(faces, key=lambda f: f[2])
+        if biggest is not matched and biggest[2] > matched[2] * STICKY_SWITCH_RATIO:
+            self._rival_count += 1
+            if self._rival_count >= STICKY_SWITCH_FRAMES:
+                self._prev_u, self._prev_v = biggest[0], biggest[1]
+                self._rival_count = 0
+                return biggest
+        else:
+            self._rival_count = 0
+
+        self._prev_u, self._prev_v = matched[0], matched[1]
+        return matched
 
 
 def index_dir(lms):
@@ -70,6 +139,9 @@ def vision_worker(face_model: str, hand_model: str, frame_q, result_q) -> None:
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision as mp_vision
 
+    no_sticky = os.environ.get("VISION_NO_STICKY", "") == "1"
+    face_sel = FaceSelector(sticky=not no_sticky)
+
     face_lm = mp_vision.FaceLandmarker.create_from_options(
         mp_vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=face_model),
@@ -95,6 +167,9 @@ def vision_worker(face_model: str, hand_model: str, frame_q, result_q) -> None:
         item = frame_q.get()
         if item is None:
             break
+        if item == "sticky_reset":
+            face_sel.reset()
+            continue
         t_grab, rgb = item
         n += 1
         out = {"kind": "det", "t": t_grab, "face": None, "n_faces": 0, "face_ms": 0.0,
@@ -105,7 +180,7 @@ def vision_worker(face_model: str, hand_model: str, frame_q, result_q) -> None:
             last_face_ts = max(last_face_ts + 1, int(t_grab * 1000))
             fres = face_lm.detect_for_video(mp_img, last_face_ts)
             out["face_ms"] = (time.monotonic() - t0) * 1000.0
-            out["face"] = pick_main_face(fres)
+            out["face"] = face_sel.select(fres)
             out["n_faces"] = len(fres.face_landmarks) if fres.face_landmarks else 0
 
             if hand_lm is not None and (n % HAND_EVERY == 0 or t_grab <= hand_boost_until):
