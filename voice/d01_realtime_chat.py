@@ -548,6 +548,11 @@ class State:
         # VIS_DEBUG 专用：视觉子进程实际看到的降采样帧 + 最新检测结果（VIS_DEBUG=1 时写入）
         self.dbg_frame_small = None   # ndarray RGB H×W×3，与视觉子进程收到的帧相同
         self.dbg_det = None           # dict {"face":(u,v,h)|None, "hand":{...}|None, "n_faces":int}
+        # VIS_DEBUG 专用：DOA 可视化字段（DEBUG-02，由 behavior_loop/main loop 写入）
+        self.dbg_gate_open = True     # 当前 M1.5-a 门控状态（True=放行，False=静音）
+        self.dbg_switching = False    # 当前是否在 M1.5-b 切换中
+        self.dbg_switch_phase = ""    # "turn" / "nearby" / "sweep" / ""
+        self.dbg_switch_target = 0.0  # 切换目标角（世界坐标，度）
         # 手势状态（GESTURE-01，仅 onnx/mediapipe backend 填充）
         self.gesture = None        # 最新手势 str 或 None
         self.gesture_at = 0.0      # 上次检出有效手势的时刻
@@ -1121,6 +1126,16 @@ def vis_debug_server(st: State, port: int, stop: threading.Event) -> None:
             tp = st.track_pitch
             locked = st.face_locked
             hand_at = st.hand_at
+            # DOA 字段
+            doa_resid = st.doa_resid_stable
+            doa_conf = st.doa_confident
+            doa_at = st.doa_at
+            body_yaw = st.body_yaw_deg
+            gate_open = st.dbg_gate_open
+            sw_active = st.dbg_switching
+            sw_phase = st.dbg_switch_phase
+            sw_target = st.dbg_switch_target
+            speaking = time.monotonic() < st.playback_end_estimate + 0.1
 
         if rgb is None:
             blank = np.zeros((360, 640, 3), dtype=np.uint8)
@@ -1193,6 +1208,82 @@ def vis_debug_server(st: State, port: int, stop: threading.Event) -> None:
         _cv2.rectangle(bgr, (0, H - 22), (W, H), (0, 0, 0), -1)
         _cv2.putText(bgr, diag, (4, H - 6),
                      _cv2.FONT_HERSHEY_SIMPLEX, 0.42, diag_color, 1)
+
+        # ── DOA 弧条（底部第二行，高 38px）──
+        _doa_h = 38          # DOA 条高度
+        _doa_y0 = H - 22 - _doa_h  # 在底部诊断行上方
+        _doa_mx = 12         # 左右边距
+        _doa_range = 90.0    # ±90°
+        _gate_deg = GATE_DEG  # ±55° 门控范围
+
+        def _deg2x(deg: float) -> int:
+            return int(_doa_mx + (deg + _doa_range) / (2 * _doa_range) * (W - 2 * _doa_mx))
+
+        # 背景黑条
+        _cv2.rectangle(bgr, (0, _doa_y0), (W, H - 22), (20, 20, 20), -1)
+
+        # 门控范围背景：±GATE_DEG 内绿透明叠，外红透明叠
+        _gate_x0 = _deg2x(-_gate_deg)
+        _gate_x1 = _deg2x(_gate_deg)
+        _overlay = bgr.copy()
+        _cv2.rectangle(_overlay, (_doa_mx, _doa_y0 + 2), (_gate_x0, H - 24), (0, 0, 80), -1)   # 左侧超范围=红
+        _cv2.rectangle(_overlay, (_gate_x1, _doa_y0 + 2), (W - _doa_mx, H - 24), (0, 0, 80), -1)  # 右侧超范围=红
+        _cv2.rectangle(_overlay, (_gate_x0, _doa_y0 + 2), (_gate_x1, H - 24), (0, 60, 0), -1)  # 范围内=绿
+        _cv2.addWeighted(_overlay, 0.4, bgr, 0.6, 0, bgr)
+
+        # 刻度线：-90 -60 -30 0 +30 +60 +90
+        for _d in (-90, -60, -30, 0, 30, 60, 90):
+            _tx = _deg2x(float(_d))
+            _cv2.line(bgr, (_tx, _doa_y0 + 2), (_tx, _doa_y0 + 8), (120, 120, 120), 1)
+            if _d != 0:
+                _lbl = f"{_d:+d}"
+                _cv2.putText(bgr, _lbl, (_tx - 10, _doa_y0 + 20),
+                             _cv2.FONT_HERSHEY_SIMPLEX, 0.33, (120, 120, 120), 1)
+            else:
+                _cv2.line(bgr, (_tx, _doa_y0 + 2), (_tx, _doa_y0 + 14), (180, 180, 180), 1)
+
+        # body_yaw 三角标（白色，朝下）
+        _bx = _deg2x(float(np.clip(body_yaw, -_doa_range, _doa_range)))
+        _tri = np.array([[_bx, _doa_y0 + 2], [_bx - 5, _doa_y0 + 10], [_bx + 5, _doa_y0 + 10]], np.int32)
+        _cv2.fillPoly(bgr, [_tri], (220, 220, 220))
+        _cv2.putText(bgr, "H", (_bx - 4, _doa_y0 + 10),
+                     _cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 0, 0), 1)
+
+        # 切换目标角（橙色三角，朝上，切换中才显示）
+        if sw_active:
+            _sx = _deg2x(float(np.clip(sw_target, -_doa_range, _doa_range)))
+            _stri = np.array([[_sx, H - 25], [_sx - 5, H - 33], [_sx + 5, H - 33]], np.int32)
+            _cv2.fillPoly(bgr, [_stri], (0, 130, 255))  # 橙
+
+        # DOA 方向箭头（主指示器，从中央向外）
+        _doa_fresh = doa_resid is not None and (time.monotonic() - doa_at) < DOA_GATE_FRESH_S
+        if doa_resid is not None:
+            _dx = _deg2x(float(np.clip(doa_resid, -_doa_range, _doa_range)))
+            _cy_bar = (_doa_y0 + H - 22) // 2
+            if doa_conf and _doa_fresh:
+                _arrow_c = (0, 220, 0)   # 绿：confident + fresh
+            elif _doa_fresh:
+                _arrow_c = (0, 180, 255)  # 橙：fresh 但不 confident
+            else:
+                _arrow_c = (80, 80, 80)   # 灰：stale
+            _cv2.arrowedLine(bgr, (_deg2x(0.0), _cy_bar), (_dx, _cy_bar),
+                             _arrow_c, 2, tipLength=0.2)
+            _cv2.circle(bgr, (_dx, _cy_bar), 4, _arrow_c, -1)
+
+        # 右下角 DOA 文字状态
+        _now_m = time.monotonic()
+        _fresh_s = f"{_now_m - doa_at:.1f}s" if doa_resid is not None else "—"
+        _resid_s = f"{doa_resid:+.0f}°" if doa_resid is not None else "—"
+        _gate_s = "OPEN" if gate_open else "BLOCK"
+        _gate_c = (0, 220, 0) if gate_open else (0, 0, 220)
+        _spk_s = "SPK" if speaking else ""
+        _sw_s = f"SW:{sw_phase}" if sw_active else ""
+        _conf_s = "conf" if doa_conf else "unc"
+        _doa_line = f"DOA {_resid_s} {_conf_s} {_fresh_s}  gate:{_gate_s}  {_sw_s}  {_spk_s}"
+        _txt_w = len(_doa_line) * 8 + 4
+        _cv2.rectangle(bgr, (W - _txt_w - 2, _doa_y0 + 2), (W - 2, _doa_y0 + 18), (0, 0, 0), -1)
+        _cv2.putText(bgr, _doa_line, (W - _txt_w, _doa_y0 + 14),
+                     _cv2.FONT_HERSHEY_SIMPLEX, 0.38, _gate_c, 1)
 
         _, jpg = _cv2.imencode(".jpg", bgr, [_cv2.IMWRITE_JPEG_QUALITY, 75])
         return jpg.tobytes()
@@ -1357,6 +1448,12 @@ def behavior_loop(st: State, snap_q: "queue.Queue", stop: threading.Event,
     switch_from = 0.0    # 切换起点(A 的世界朝向)
     switch_target = 0.0  # 切换目标角(confident 时=A方向+resid)
     switch_phase = "turn"  # turn(confident 直转)/ sweep(不确信或转过去没脸→扫)
+
+    def _sync_switch_dbg():
+        with st.lock:
+            st.dbg_switching = switching
+            st.dbg_switch_phase = switch_phase if switching else ""
+            st.dbg_switch_target = switch_target
     sw_t = 0.0
     sw_dir = 1.0
     play_big_since = None    # 近处晃动大手持续出现的起点(PLAY-01 进入迟滞)
@@ -1456,6 +1553,7 @@ def behavior_loop(st: State, snap_q: "queue.Queue", stop: threading.Event,
             wide_scan = False
             greet_armed = True
             sw_t = now
+            _sync_switch_dbg()
             log(f"🔀 切换({_tier}):从A(at {switch_from:+.0f}°)")
             set_state(ST_ENGAGING, seed_interact=True)
             continue
@@ -1542,6 +1640,7 @@ def behavior_loop(st: State, snap_q: "queue.Queue", stop: threading.Event,
                             st.greet_now = True
                         greet_armed = False
                     switching = False
+                    _sync_switch_dbg()
                     set_state(ST_TRACKING, seed_interact=True)
                     continue
                 if (now - phase_t) > SWITCH_TIMEOUT_S:
@@ -1550,6 +1649,7 @@ def behavior_loop(st: State, snap_q: "queue.Queue", stop: threading.Event,
                         st.wake_cue = "giveup"
                         st.wake_cue_t = now
                     switching = False
+                    _sync_switch_dbg()
                     set_state(ST_RETURNING)
                     continue
                 if switch_phase == "turn":
@@ -1558,6 +1658,7 @@ def behavior_loop(st: State, snap_q: "queue.Queue", stop: threading.Event,
                     if arrived:
                         switch_phase = "sweep"
                         sw_t = now
+                        _sync_switch_dbg()
                         log(f"🔀 到位({switch_target:+.0f}°) → 附近找脸(±{SEEK_NEARBY_DEG:.0f}°)")
                 else:
                     tsw = now - sw_t
@@ -1931,13 +2032,41 @@ class KwsGate:
         self.stream = self.kws.create_stream()
         self._last_raw = -1e9
         self._last_wake = -1e9
+        self._diag_t = time.monotonic()
+        self._diag_chunks = self._diag_dec = 0
+        self._diag_rms_sq = self._diag_rms_n = 0
+        self._diag_ch_done = False   # 只打一次各通道 RMS 对比
 
-    def feed(self, mono: "np.ndarray") -> bool:
+    def feed(self, mono: "np.ndarray", chunk_full: "np.ndarray | None" = None) -> bool:
+        # 只打一次各通道 RMS（帮助定位哪个通道有声）
+        if not self._diag_ch_done and chunk_full is not None and chunk_full.ndim == 2:
+            ch_rms = [(c, float((chunk_full[:, c].astype(np.float64) ** 2).mean()) ** 0.5)
+                      for c in range(chunk_full.shape[1])]
+            log(f"[KWS通道诊断] shape={chunk_full.shape} dtype={chunk_full.dtype} "
+                f"min={float(chunk_full.min()):.5f} max={float(chunk_full.max()):.5f} | "
+                + " ".join(f"ch{c}={r:.5f}" for c, r in ch_rms))
+            self._diag_ch_done = True
         self.stream.accept_waveform(16000, np.ascontiguousarray(mono, dtype=np.float32))
         hit = False
+        n_dec = 0
         while self.kws.is_ready(self.stream):
             self.kws.decode_stream(self.stream)
-        if self.kws.get_result(self.stream):
+            n_dec += 1
+        self._diag_chunks += 1
+        self._diag_dec += n_dec
+        self._diag_rms_sq += float(np.dot(mono, mono))
+        self._diag_rms_n += len(mono)
+        now = time.monotonic()
+        if now - self._diag_t > 3.0:
+            rms = (self._diag_rms_sq / max(1, self._diag_rms_n)) ** 0.5
+            log(f"[KWS诊断] chunks={self._diag_chunks} dec={self._diag_dec} "
+                f"RMS={rms:.4f} {'⚠ 静音?' if rms < 0.001 else '✅ 有声'}")
+            self._diag_chunks = self._diag_dec = 0
+            self._diag_rms_sq = self._diag_rms_n = 0
+            self._diag_t = now
+        result = self.kws.get_result(self.stream)
+        if result:
+            log(f"[KWS] 原始命中: {result!r}")
             self.kws.reset_stream(self.stream)
             hit = True
         if not hit:
@@ -2000,6 +2129,8 @@ def main() -> int:
                 if not audio_ok:
                     log("⚠ audio 未初始化 → 麦克风/播放不可用。尝试用 media_backend='local' 重连...")
                 mini.media.start_recording()
+                # macOS：先让录音管线稳定，再启播放管线，避免 osxaudiosrc 被干扰输出全零
+                time.sleep(0.5)
                 mini.media.start_playing()
                 log("✅ 录音/播放管线已启动")
             else:
@@ -2017,6 +2148,14 @@ def main() -> int:
                         warm = _f
                         break
                     time.sleep(0.05)
+                _cap_warm.release()
+            else:
+                warm = None
+                wdl = time.monotonic() + 10.0
+                while warm is None and time.monotonic() < wdl:
+                    warm = mini.media.get_frame()
+                    if warm is None:
+                        time.sleep(0.05)
             log(f"摄像头:{'✅ 出帧 ' + str(warm.shape) if warm is not None else '⚠ 10s 无帧(跟随/take_snapshot 可能失败)'}")
 
             callback = ChatCallback(st, play_q, motion_q, snap_q, mini)
@@ -2140,7 +2279,7 @@ def main() -> int:
                         continue
                     mono = chunk[:, 0]
                     # WAKE-01:同一份 16k mono 始终喂 KWS(本地);engaged 才扇出给 Qwen
-                    wake = kws_gate.feed(mono) if kws_gate is not None else False
+                    wake = kws_gate.feed(mono, chunk) if kws_gate is not None else False
                     with st.lock:
                         state = st.state
                         woke_pending = st.wake_ok
@@ -2231,6 +2370,8 @@ def main() -> int:
                         else:
                             log(f"🚪 门控:关(确信范围外 resid {g_resid:+.0f}° >±{GATE_DEG:.0f})→ 发静音,不送/不打断/不计时")
                         prev_gate_open = gate_open
+                        with st.lock:
+                            st.dbg_gate_open = gate_open
                     if gate_open:
                         pcm16 = np.clip(mono * 32767.0, -32768, 32767).astype(np.int16)
                     else:
