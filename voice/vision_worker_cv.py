@@ -60,6 +60,8 @@ def vision_worker(face_model: str, hand_model: str, frame_q, result_q) -> None:
         item = frame_q.get()
         if item is None:
             break
+        if item == "sticky_reset":
+            continue
         t_grab, rgb = item
         n += 1
         out = {"kind": "det", "t": t_grab, "face": None, "n_faces": 0,

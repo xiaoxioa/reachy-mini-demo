@@ -45,20 +45,20 @@ echo ""
 info "检查 Python 环境..."
 [ -f "$PYTHON" ] || error "找不到 .venv，请先在项目根目录执行: uv sync"
 
-# ── 2. 检查 DASHSCOPE_API_KEY（NO_VOICE=1 时跳过）───────────────
-if [ "${NO_VOICE:-0}" != "1" ]; then
-  if [ -z "${DASHSCOPE_API_KEY:-}" ]; then
-    echo ""
-    warn "未检测到 DASHSCOPE_API_KEY"
-    echo -n "  请输入阿里云百炼 API Key（sk-...）: "
-    read -r DASHSCOPE_API_KEY
-    [ -z "$DASHSCOPE_API_KEY" ] && error "API Key 不能为空"
-    export DASHSCOPE_API_KEY
-  fi
-  info "DASHSCOPE_API_KEY 已就绪 (${#DASHSCOPE_API_KEY} 位)"
-else
-  info "NO_VOICE=1 — 跳过 API Key 检查（仅视觉测试模式）"
-fi
+# # ── 2. 检查 DASHSCOPE_API_KEY（NO_VOICE=1 时跳过）───────────────
+# if [ "${NO_VOICE:-0}" != "1" ]; then
+#   if [ -z "${DASHSCOPE_API_KEY:-}" ]; then
+#     echo ""
+#     warn "未检测到 DASHSCOPE_API_KEY"
+#     echo -n "  请输入阿里云百炼 API Key（sk-...）: "
+#     read -r DASHSCOPE_API_KEY
+#     [ -z "$DASHSCOPE_API_KEY" ] && error "API Key 不能为空"
+#     export DASHSCOPE_API_KEY
+#   fi
+#   info "DASHSCOPE_API_KEY 已就绪 (${#DASHSCOPE_API_KEY} 位)"
+# else
+#   info "NO_VOICE=1 — 跳过 API Key 检查（仅视觉测试模式）"
+# fi
 
 # ── 3. 找串口 ────────────────────────────────────────────────
 info "扫描 USB 串口..."
@@ -72,15 +72,23 @@ if [ -z "$SERIAL_PORT" ]; then
 fi
 info "找到串口: $SERIAL_PORT"
 
-# # ── 4. 停止残留进程 ──────────────────────────────────────────
-# if [ -f "$DAEMON_PID" ] && kill -0 "$(cat "$DAEMON_PID")" 2>/dev/null; then
-#   warn "发现旧 daemon 进程，先停止..."
-#   kill "$(cat "$DAEMON_PID")" 2>/dev/null; sleep 2
-# fi
-# if [ -f "$MAIN_PID" ] && kill -0 "$(cat "$MAIN_PID")" 2>/dev/null; then
-#   warn "发现旧主程序进程，先停止..."
-#   kill "$(cat "$MAIN_PID")" 2>/dev/null; sleep 1
-# fi
+# ── 4. 停止残留进程 ──────────────────────────────────────────
+if [ -f "$DAEMON_PID" ] && kill -0 "$(cat "$DAEMON_PID")" 2>/dev/null; then
+  warn "发现旧 daemon 进程，先停止..."
+  kill "$(cat "$DAEMON_PID")" 2>/dev/null; sleep 2
+fi
+if [ -f "$MAIN_PID" ] && kill -0 "$(cat "$MAIN_PID")" 2>/dev/null; then
+  warn "发现旧主程序进程，先停止..."
+  kill "$(cat "$MAIN_PID")" 2>/dev/null; sleep 1
+fi
+# 清理占用调试端口的残留进程（防止 VIS_DEBUG [Errno 48]）
+_VIS_PORT="${VIS_DEBUG_PORT:-7654}"
+_OLD_PID=$(lsof -ti tcp:"$_VIS_PORT" 2>/dev/null || true)
+if [ -n "$_OLD_PID" ]; then
+  warn "端口 $_VIS_PORT 被 PID $_OLD_PID 占用，先杀掉..."
+  kill "$_OLD_PID" 2>/dev/null || true
+  sleep 0.5
+fi
 
 # ── 5. 启动 daemon ───────────────────────────────────────────
 mkdir -p "$LOG_DIR"
