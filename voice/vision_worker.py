@@ -193,7 +193,8 @@ def vision_worker(face_model: str, hand_model: str, frame_q, result_q) -> None:
     face_lm = mp_vision.FaceLandmarker.create_from_options(
         mp_vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=face_model),
-            running_mode=mp_vision.RunningMode.VIDEO, num_faces=2))
+            running_mode=mp_vision.RunningMode.VIDEO, num_faces=2,
+            output_face_blendshapes=True))
     hand_lm = None
     try:
         hand_lm = mp_vision.HandLandmarker.create_from_options(
@@ -231,6 +232,17 @@ def vision_worker(face_model: str, hand_model: str, frame_q, result_q) -> None:
             out["face_ms"] = (time.monotonic() - t0) * 1000.0
             out["face"] = face_sel.select(fres)
             out["n_faces"] = len(fres.face_landmarks) if fres.face_landmarks else 0
+            # M3-b 表情:从选中脸的 blendshapes 提取微笑/皱眉
+            if fres.face_blendshapes and out["face"] is not None:
+                _bs = fres.face_blendshapes[0]
+                _smile = _frown = 0.0
+                for cat in _bs:
+                    if cat.category_name == "mouthSmileLeft" or cat.category_name == "mouthSmileRight":
+                        _smile += cat.score * 0.5
+                    elif cat.category_name == "mouthFrownLeft" or cat.category_name == "mouthFrownRight":
+                        _frown += cat.score * 0.5
+                out["smile"] = _smile
+                out["frown"] = _frown
 
             if hand_lm is not None and (n % HAND_EVERY == 0 or t_grab <= hand_boost_until):
                 # 手部检测要求时间戳严格 > 上次,且与 face 流不冲突 → 用独立递增计数

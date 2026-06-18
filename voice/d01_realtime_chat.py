@@ -72,7 +72,10 @@ import sys
 import threading
 import time
 import urllib.request
+import random
+import uuid
 from collections import deque
+from datetime import datetime, timezone
 
 # VIS_DEBUG 日志环形缓冲区（/state.json 消费）
 _vis_log_buf: "deque[tuple[int, str]]" = deque(maxlen=1000)
@@ -82,6 +85,7 @@ import numpy as np
 from PIL import Image
 from scipy.signal import resample_poly
 from scipy.spatial.transform import Rotation as R
+import pytweening
 
 import dashscope
 from dashscope.audio.qwen_omni import (
@@ -242,6 +246,7 @@ CUE = {
     "fail_dur": 0.80,  "fail_pitch": 6.0,  "fail_ant": 0.7,    # 下垂 "没连上。"
     "giveup_dur": 0.40, "giveup_pitch": 3.5, "giveup_ant": 0.35,  # 轻微下沉 "咦?没人。"(比 fail 更轻)
     "bye_dur": 0.45,   "bye_pitch": 3.5,   "bye_ant": 0.45,    # 收束告别(EXIT-01;与 heard 上扬首尾呼应)
+    "barge_dur": 0.25, "barge_pitch": 2.0, "barge_ant": 0.3,   # 打断微反应(M3-b:微微后仰+天线收缩)
 }
 # 命中转向(M1c-b,策略 A;阈值依据见 CALIBRATION §14 DOA 实测)
 SPREAD_BAD = 40.0          # DOA 窗 IQR ≥ 此值 = 深后翻转不稳 → 坏区走宽扫(实测:可用≤15° / 深后~90°)
@@ -302,6 +307,38 @@ PLAY_JOY_DELAY_S = 5.0     # 持续逗它这么久后才第一次摇天线(用�
 PLAY_JOY_PERIOD_S = 7.0    # 之后每隔此值小摇一次(有节奏不神经质)
 PLAY_JOY_FLICK_S = 0.6     # 小天线摆时长
 PLAY_REENTRY_S = 3.0       # 退出后这么久内再进入算"继续逗",不重置节拍(防进出抖动)
+
+# ── M3-a 运动基础:缓动曲线 + 全态呼吸 + 微变异 ──
+EASE_ATTACK_FRAC = 0.35    # cue 攻击阶段占比(easeOutBack 快速上冲带过冲)
+BREATH_PARAMS = {           # 全态呼吸 (freq_hz, pitch_amp_deg);τ=2s 平滑切换
+    "ARMED":       (0.18, 2.5),
+    "IDLE_CENTER": (0.22, 1.8),
+    "TRACKING":    (0.25, 1.0),
+    "SEARCHING":   (0.25, 1.0),
+    "ENGAGING":    (0.20, 0.5),
+    "RETURNING":   (0.22, 1.5),
+    "POINTING":    (0.20, 0.5),
+    "PLAYING":     (0.30, 0.8),
+}
+BREATH_BLEND_TAU = 2.0     # 呼吸参数切换平滑常数(s)
+CUE_VARIATION = 0.15       # cue 微变异幅度(±15%)
+
+# ── M3-b 事件反应:打断微反应 + 思考微行为 + 表情回应 ──
+THINK_ROLL_AMP = 3.0       # 思考歪头幅度(度)
+THINK_ROLL_F = 0.15        # Hz
+THINK_PITCH = -1.5         # 思考时微微抬头(度)
+THINK_ANT_AMP = 0.15       # 天线不对称摆动幅度(rad)
+THINK_ANT_F = 0.25         # Hz
+THINK_BLEND_TAU = 0.5      # 思考行为淡入淡出(s)
+EXPR_SMILE_ANT = 0.20      # 用户微笑 → 天线上扬(rad)
+EXPR_FROWN_ANT = -0.15     # 用户皱眉 → 天线下垂(rad)
+EXPR_BLEND_TAU = 0.8       # 表情响应平滑常数(s)
+
+# ── M3-c 记忆 ──
+_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+PROFILE_PATH = os.path.join(_DATA_DIR, "profile.json")
+MEMORY_PATH = os.path.join(_DATA_DIR, "memory.v1.json")
+SUMMARY_MODEL = "qwen-turbo"
 
 
 def log(msg: str) -> None:
@@ -407,6 +444,12 @@ TOOLS = [
     {"type": "function", "name": "identify_pointed_object",
      "description": "当用户用手指指向画面中某个物体、问'这是什么''我指的是什么''这个是啥'等需要判断他指向哪个物体时调用。会拍照并理解用户手指指向的目标。",
      "parameters": _NOPARAM},
+    {"type": "function", "name": "remember",
+     "description": "记住用户说的一件事。当用户让你记住什么(如偏好、名字、重要信息)时调用。",
+     "parameters": {"type": "object", "properties": {"content": {"type": "string", "description": "要记住的内容"}}, "required": ["content"]}},
+    {"type": "function", "name": "forget",
+     "description": "忘掉之前记住的一件事。当用户让你忘掉某个记忆时调用。",
+     "parameters": {"type": "object", "properties": {"content": {"type": "string", "description": "要忘掉的关键词或内容"}}, "required": ["content"]}},
 ]
 
 # 看图 prompt(POINT-01)。两个都做"指向感知":工具路由从音频判断"是否指向"不可靠
@@ -458,6 +501,87 @@ def parse_judge(raw: str) -> dict | None:
         return d if isinstance(d, dict) else None
     except Exception:
         return None
+
+
+# ───────────────────────── M3-c 记忆:读写 + 退出摘要 ─────────────────────────
+def _ensure_data_dir():
+    os.makedirs(_DATA_DIR, exist_ok=True)
+
+def load_profile() -> dict | None:
+    try:
+        with open(PROFILE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+def save_profile(profile: dict):
+    _ensure_data_dir()
+    with open(PROFILE_PATH, "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+
+def load_memories() -> list:
+    try:
+        with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("items", [])
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def save_memories(items: list):
+    _ensure_data_dir()
+    with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+        json.dump({"items": items}, f, ensure_ascii=False, indent=2)
+
+def do_remember(content: str) -> str:
+    items = load_memories()
+    items.append({
+        "id": str(uuid.uuid4())[:8],
+        "content": content,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    save_memories(items)
+    return f"已记住:{content}"
+
+def do_forget(keyword: str) -> str:
+    items = load_memories()
+    remaining = [it for it in items if keyword.lower() not in it["content"].lower()]
+    removed = len(items) - len(remaining)
+    if removed > 0:
+        save_memories(remaining)
+        return f"已忘掉 {removed} 条包含「{keyword}」的记忆。"
+    return f"没找到包含「{keyword}」的记忆。"
+
+def summarize_conversation(oai_client, conversation_log: list) -> dict | None:
+    if not conversation_log or len(conversation_log) < 2:
+        return None
+    try:
+        text = "\n".join(f"{'用户' if r == 'user' else '小艺'}: {t}"
+                         for r, t in conversation_log if t and t.strip())
+        if len(text) < 20:
+            return None
+        resp = oai_client.chat.completions.create(
+            model=SUMMARY_MODEL,
+            messages=[
+                {"role": "system",
+                 "content": "你是对话摘要助手。根据以下对话,输出一个JSON对象(不要代码块标记):"
+                 '{"summary":"一两句话概括本次对话","preferences":["用户偏好(若有)"],'
+                 '"topics":["讨论话题"]}'},
+                {"role": "user", "content": text[-3000:]},
+            ],
+            temperature=0.3,
+        )
+        raw = resp.choices[0].message.content.strip()
+        d = parse_judge(raw)
+        if d:
+            d["updated_at"] = datetime.now(timezone.utc).isoformat()
+            existing = load_profile() or {}
+            if "preferences" in existing and "preferences" in d:
+                merged = list(set(existing.get("preferences", []) + d.get("preferences", [])))
+                d["preferences"] = merged[-10:]
+            return d
+    except Exception as e:
+        log(f"⚠ 对话摘要失败:{e}")
+    return None
 
 
 # ───────────────────────── One Euro 滤波(VIS-01 验证参数)─────────────────────────
@@ -565,6 +689,18 @@ class State:
         self.gesture = None        # 最新手势 str 或 None
         self.gesture_at = 0.0      # 上次检出有效手势的时刻
         self.gesture_fingers = 0   # 最新手指数
+        # M3 运动/反应 flags(main 设置,运行时不变)
+        self.no_easing = False
+        self.no_breathe = False
+        self.no_variation = False
+        self.no_expression = False
+        self.no_memory = False
+        # M3-b 思考/表情
+        self.thinking = False          # 模型思考中(speech_stopped → first audio out)
+        self.user_smile = 0.0          # blendshape 微笑系数 0-1
+        self.user_frown = 0.0          # blendshape 皱眉系数 0-1
+        # M3-c 对话记录(退出时摘要用)
+        self.conversation_log = []     # [(role, text), ...]
 
 
 # ───────────────────────── ①对话:回调,收服务端事件(打断/工具分发/计时器喂养)─────────────────────────
@@ -603,6 +739,11 @@ class ChatCallback(OmniRealtimeCallback):
             log(f"⚠ clear_player 失败:{type(e).__name__}: {e}")
         if in_flight and self.conv is not None:
             self.conv.cancel_response()
+        # M3-b 打断微反应:短促后仰+天线收缩
+        if not st.no_expression:
+            with st.lock:
+                st.wake_cue = "barge"
+                st.wake_cue_t = time.monotonic()
         log("⛔ 打断:已停止播放" + (",并取消在途回复" if in_flight else ""))
 
     def on_event(self, event) -> None:  # SDK 实际传入已解析的 dict
@@ -625,16 +766,22 @@ class ChatCallback(OmniRealtimeCallback):
                 if playing or in_flight:
                     self._do_barge_in(in_flight)
             elif etype == "input_audio_buffer.speech_stopped":
+                with st.lock:
+                    st.thinking = True     # M3-b:模型开始处理,头开始歪
                 log("🤫 检测到你说完了,等模型回应…")
             elif etype == "conversation.item.input_audio_transcription.completed":
-                log(f"📝 听到的是:「{(event.get('transcript') or '').strip()}」")
+                _transcript = (event.get("transcript") or "").strip()
+                log(f"📝 听到的是:「{_transcript}」")
+                if _transcript and not st.no_memory:
+                    with st.lock:
+                        st.conversation_log.append(("user", _transcript))
             elif etype == "response.created":
                 with st.lock:
                     st.in_flight += 1
                     st.drop_audio = False
                     st.resp_audio_count = 0
                     st.fc_seen_this_resp = False
-                    st.last_interaction_at = now  # 机器人开口 → 喂 RETURNING 计时器
+                    st.last_interaction_at = now
                 log("💭 模型开始生成回复…")
             elif etype == "response.function_call_arguments.done":
                 name = event.get("name", "")
@@ -676,12 +823,32 @@ class ChatCallback(OmniRealtimeCallback):
                         st.exit_request = True
                     log(f"👋 收到结束意图 → 告别「{phrase}」+ 回待命")
                 elif name == "identify_pointed_object":
-                    # 指向工具:同样先 judge(模型以为在指 ≠ 真在指,例如托下巴/无手势)。
-                    # snapshot_pending 先占位,防 response.done 抢跑。
                     with st.lock:
                         st.snapshot_pending += 1
                     log("👉 收到指向请求 → 先原地看图判断(两段式)")
                     self.snap_q.put({"call_id": call_id, "gen": st.fc_gen, "mode": "judge"})
+                elif name == "remember":
+                    _ma = json.loads(event.get("arguments", "{}"))
+                    _result = do_remember(_ma.get("content", ""))
+                    log(f"📝 记住:{_ma.get('content', '')}")
+                    try:
+                        self.conv.create_item({
+                            "type": "function_call_output", "call_id": call_id,
+                            "output": json.dumps({"success": True, "say": _result}, ensure_ascii=False),
+                        })
+                    except Exception as e:
+                        log(f"⚠ remember 回 output 失败:{e}")
+                elif name == "forget":
+                    _ma = json.loads(event.get("arguments", "{}"))
+                    _result = do_forget(_ma.get("content", ""))
+                    log(f"📝 忘掉:{_ma.get('content', '')}")
+                    try:
+                        self.conv.create_item({
+                            "type": "function_call_output", "call_id": call_id,
+                            "output": json.dumps({"success": True, "say": _result}, ensure_ascii=False),
+                        })
+                    except Exception as e:
+                        log(f"⚠ forget 回 output 失败:{e}")
                 else:
                     # 手势:乐观即时回 output → 说话不等动作做完
                     self.motion_q.put({"name": name, "call_id": call_id})
@@ -697,12 +864,18 @@ class ChatCallback(OmniRealtimeCallback):
                 print(event.get("delta", ""), end="", flush=True)
             elif etype == "response.audio_transcript.done":
                 print(flush=True)
+                _atext = (event.get("transcript") or "").strip()
+                if _atext and not st.no_memory:
+                    with st.lock:
+                        st.conversation_log.append(("assistant", _atext))
             elif etype == "response.audio.delta":
                 with st.lock:
                     if st.drop_audio:
                         return
                     gen = st.play_gen
                     st.resp_audio_count += 1
+                    if st.thinking:
+                        st.thinking = False    # M3-b:收到首段音频,停止歪头
                 b64 = event.get("delta") or event.get("audio") or ""
                 pcm = np.frombuffer(base64.b64decode(b64), dtype=np.int16)
                 f16k = resample_poly(pcm.astype(np.float32) / 32768.0, PLAY_SR, OUT_SR).astype(np.float32)
@@ -1082,6 +1255,12 @@ def vision_result_loop(st: State, result_q, stop: threading.Event) -> None:
             if miss_streak >= VIS_MISS_N:  # 1c:连续 N 帧漏检才重置滤波(防侧脸闪断)
                 fx.reset()
                 fy.reset()
+
+        # M3-b 表情:读取 blendshape 微笑/皱眉
+        if "smile" in msg:
+            with st.lock:
+                st.user_smile = msg["smile"]
+                st.user_frown = msg.get("frown", 0.0)
 
         if VIS_DEBUG:
             with st.lock:
@@ -2115,18 +2294,31 @@ def behavior_loop(st: State, snap_q: "queue.Queue", stop: threading.Event,
 # ───────────────────────── 头部控制线程:渲染层(唯一 set_target 写入口)─────────────────────────
 def head_control_loop(mini: ReachyMini, st: State, stop: threading.Event) -> None:
     """25Hz 唯一硬件写入口:头部姿态 = behavior/视觉给的 track 目标 + 微动叠加 + body_yaw。
-    手势执行中(action_active)完全让位(motion goto 独占);微动仅在 IDLE/TRACKING 且说话时叠加。
-    PLAYING(逗它)开心表达在此叠加渲染:进入只专注跟手,持续逗 PLAY_JOY_DELAY_S 后
-    才第一次摇天线,之后周期小摇;短暂中断(<PLAY_REENTRY_S)再进入算"继续逗"不重置节拍;
-    全程不打断跟手(set_target 同帧带 antennas)。"""
+    M3 新增:全态呼吸(per-state, τ=2s 切换)、cue 缓动曲线(easeOutBack)、cue 微变异(±15%)、
+    思考歪头(模型处理中)、表情回应(blendshape → 天线)。"""
     dt = 1.0 / IDLE_HZ
     amp = 0.0
     sway_scale = 1.0
     prev_state = ST_IDLE
-    joy_until = 0.0      # 当前天线摆动窗口的截止
-    next_joy = 0.0       # 下一次摇天线的时刻
-    last_play_exit = -1e9  # 上次退出 PLAYING 的时刻(重入防抖)
-    ant_parked = True    # 天线已归位(避免每帧重复发中立位)
+    joy_until = 0.0
+    next_joy = 0.0
+    last_play_exit = -1e9
+    ant_parked = True
+    # M3-a 呼吸状态(平滑切换)
+    br_freq = ARMED_BREATH_F
+    br_amp_cur = ARMED_BREATH_PITCH
+    # M3-a cue 微变异(新 cue 触发时随机化)
+    prev_cue = None
+    prev_cue_t = 0.0
+    v_dur = v_pitch = v_ant = 0.0
+    # M3-b 思考/表情平滑
+    think_env = 0.0
+    expr_ant_cur = 0.0
+    # 读一次 flags(运行时不变)
+    _no_easing = st.no_easing
+    _no_breathe = st.no_breathe
+    _no_variation = st.no_variation
+    _no_expression = st.no_expression
     while not stop.is_set():
         now = time.monotonic()
         with st.lock:
@@ -2137,40 +2329,87 @@ def head_control_loop(mini: ReachyMini, st: State, stop: threading.Event) -> Non
             tracked = (now - st.face_seen_at) < LOST_HOLD_S
             wake_cue = st.wake_cue
             wake_cue_t = st.wake_cue_t
+            thinking = st.thinking
+            u_smile = st.user_smile
+            u_frown = st.user_frown
         if action:
-            amp = 0.0  # 硬让位:手势 goto 独占
+            amp = 0.0
             prev_state = state
             time.sleep(dt)
             continue
 
-        # 唤醒确认动作(M1c-a):叠加偏置(pitch 偏置 + 天线覆盖),包络 0→1→0;
-        # 单槽后到覆盖先到(fail 接管 heard);additive 不抢渲染,转向一来基座照走、cue 自然衰减。
+        # ── M3-a 全态呼吸(per-state freq/amp, τ=2s 平滑切换)──
+        if not _no_breathe:
+            _bp = BREATH_PARAMS.get(state, (0.22, 1.0))
+            br_freq += (_bp[0] - br_freq) * (dt / BREATH_BLEND_TAU)
+            br_amp_cur += (_bp[1] - br_amp_cur) * (dt / BREATH_BLEND_TAU)
+            breath = br_amp_cur * math.sin(2 * math.pi * br_freq * now)
+        else:
+            breath = 0.0
+
+        # ── Cue 渲染:M3-a 缓动(easeOutBack 攻击 + easeInQuad 衰减)+ 微变异(±15%)──
         cue_pitch, cue_ant = 0.0, None
         if wake_cue is not None:
+            if wake_cue != prev_cue or wake_cue_t != prev_cue_t:
+                _bd = CUE.get(f"{wake_cue}_dur", 0.4)
+                _bp_c = CUE.get(f"{wake_cue}_pitch", 3.0)
+                _ba = CUE.get(f"{wake_cue}_ant", 0.3)
+                if not _no_variation:
+                    _rv = lambda b: b * (1.0 + random.uniform(-CUE_VARIATION, CUE_VARIATION))
+                    v_dur, v_pitch, v_ant = _rv(_bd), _rv(_bp_c), _rv(_ba)
+                else:
+                    v_dur, v_pitch, v_ant = _bd, _bp_c, _ba
+                prev_cue = wake_cue
+                prev_cue_t = wake_cue_t
             el = now - wake_cue_t
-            dur = CUE[f"{wake_cue}_dur"]
-            if 0.0 <= el < dur:
-                env = math.sin(math.pi * el / dur)
+            if v_dur > 0 and 0.0 <= el < v_dur:
+                t_norm = el / v_dur
+                if not _no_easing:
+                    if t_norm < EASE_ATTACK_FRAC:
+                        env = pytweening.easeOutBack(min(t_norm / EASE_ATTACK_FRAC, 1.0))
+                    else:
+                        env = 1.0 - pytweening.easeInQuad(
+                            min((t_norm - EASE_ATTACK_FRAC) / (1.0 - EASE_ATTACK_FRAC), 1.0))
+                    env = max(0.0, env)
+                else:
+                    env = math.sin(math.pi * t_norm)
                 if wake_cue == "heard":
-                    cue_pitch = -CUE["heard_pitch"] * env          # 抬头(pitch+ 为低头,故取负)
-                    da = CUE["heard_ant"] * env                    # 天线上扬
+                    cue_pitch = -v_pitch * env
+                    da = v_ant * env
                 elif wake_cue == "fail":
-                    cue_pitch = +CUE["fail_pitch"] * env           # 低头(连失败)
-                    da = -CUE["fail_ant"] * env                    # 天线下垂
-                elif wake_cue == "giveup":                         # 宽扫没人,比 fail 更轻
-                    cue_pitch = +CUE["giveup_pitch"] * env
-                    da = -CUE["giveup_ant"] * env
-                else:  # bye(EXIT-01 收束告别,与 heard 上扬首尾呼应)
-                    cue_pitch = +CUE["bye_pitch"] * env
-                    da = -CUE["bye_ant"] * env
+                    cue_pitch = +v_pitch * env
+                    da = -v_ant * env
+                elif wake_cue == "giveup":
+                    cue_pitch = +v_pitch * env
+                    da = -v_ant * env
+                elif wake_cue == "barge":
+                    cue_pitch = -v_pitch * env
+                    da = -v_ant * env
+                else:  # bye
+                    cue_pitch = +v_pitch * env
+                    da = -v_ant * env
                 cue_ant = [INIT_ANTENNAS[0] + da, INIT_ANTENNAS[1] + da]
 
-        # WAKE-01 armed:慢呼吸(小幅低头起伏)+ 唤醒确认 cue 叠加
+        # ── M3-b 思考微行为(模型处理中歪头 + 天线不对称摆)──
+        if not _no_expression and thinking and state in (ST_TRACKING, ST_IDLE, ST_SEARCHING):
+            think_env += (1.0 - think_env) * (dt / THINK_BLEND_TAU)
+        else:
+            think_env += (0.0 - think_env) * (dt / THINK_BLEND_TAU)
+        think_roll = think_env * THINK_ROLL_AMP * math.sin(2 * math.pi * THINK_ROLL_F * now)
+        think_pitch_off = think_env * THINK_PITCH
+
+        # ── M3-b 表情回应(用户微笑/皱眉 → 天线偏置)──
+        if not _no_expression:
+            _expr_target = u_smile * EXPR_SMILE_ANT + u_frown * EXPR_FROWN_ANT
+            expr_ant_cur += (_expr_target - expr_ant_cur) * (dt / EXPR_BLEND_TAU)
+        else:
+            expr_ant_cur = 0.0
+
+        # ── ARMED 早返回:呼吸 + cue ──
         if state == ST_ARMED:
-            br = ARMED_BREATH_PITCH * math.sin(2 * math.pi * ARMED_BREATH_F * now)
             ant = cue_ant if cue_ant is not None else list(INIT_ANTENNAS)
             try:
-                mini.set_target(head=head_pose(pitch_deg=tp + br + cue_pitch, yaw_deg=ty),
+                mini.set_target(head=head_pose(pitch_deg=tp + breath + cue_pitch, yaw_deg=ty),
                                 antennas=ant, body_yaw=math.radians(body))
             except Exception:
                 time.sleep(1.0)
@@ -2183,38 +2422,53 @@ def head_control_loop(mini: ReachyMini, st: State, stop: threading.Event) -> Non
         if state == ST_PLAYING and prev_state != ST_PLAYING:
             ant_parked = False
             if now - last_play_exit > PLAY_REENTRY_S:
-                next_joy = now + PLAY_JOY_DELAY_S  # 新一轮逗它:专注期后才第一次摇
-            # 否则:短暂中断后的继续,沿用原节拍(不重置、无任何进场动作)
+                next_joy = now + PLAY_JOY_DELAY_S
         elif state != ST_PLAYING and prev_state == ST_PLAYING:
             last_play_exit = now
         if state == ST_PLAYING and now >= next_joy:
-            joy_until = now + PLAY_JOY_FLICK_S     # 小摇一下(有节奏,不神经质)
+            joy_until = now + PLAY_JOY_FLICK_S
             next_joy = now + PLAY_JOY_PERIOD_S
         prev_state = state
 
         antennas = None
         if state == ST_PLAYING:
             if now < joy_until:
-                w = 0.3 * math.sin(2 * math.pi * 3.0 * now)  # 3Hz 欢快小摆
+                w = 0.3 * math.sin(2 * math.pi * 3.0 * now)
                 antennas = [INIT_ANTENNAS[0] - w, INIT_ANTENNAS[1] + w]
             else:
-                antennas = list(INIT_ANTENNAS)   # 非摆动窗口:持续下发中立,姿态稳定
+                antennas = list(INIT_ANTENNAS)
         elif not ant_parked:
-            antennas = list(INIT_ANTENNAS)       # 退出逗它:归位一次
+            antennas = list(INIT_ANTENNAS)
             ant_parked = True
 
-        sway_ok = state in (ST_IDLE, ST_TRACKING)   # 转向/搜寻/回中/逗它中不叠微动
+        # M3-b 天线叠加:思考 + 表情(仅 cue 未接管时)
+        _need_ant = (cue_ant is None and (think_env > 0.01 or abs(expr_ant_cur) > 0.005))
+        if _need_ant and antennas is None:
+            antennas = list(INIT_ANTENNAS)
+        if antennas is not None and cue_ant is None:
+            if think_env > 0.01:
+                _ta = think_env * THINK_ANT_AMP * math.sin(2 * math.pi * THINK_ANT_F * now)
+                antennas[0] += _ta
+                antennas[1] -= _ta
+            if abs(expr_ant_cur) > 0.005:
+                antennas[0] += expr_ant_cur
+                antennas[1] += expr_ant_cur
+
+        sway_ok = state in (ST_IDLE, ST_TRACKING)
         amp += ((1.0 if (speaking and sway_ok) else 0.0) - amp) * (dt / IDLE_TAU)
         target_scale = TRACK_SWAY_SCALE if tracked else 1.0
         sway_scale += (target_scale - sway_scale) * (dt / IDLE_TAU)
         sway_yaw = amp * sway_scale * IDLE_YAW_AMP * math.sin(2 * math.pi * IDLE_YAW_F * now)
         sway_pitch = amp * sway_scale * IDLE_PITCH_AMP * math.sin(2 * math.pi * IDLE_PITCH_F * now + 1.0)
-        if cue_ant is not None:          # 唤醒确认动作期间天线由 cue 接管(覆盖微动/逗它天线)
+        if cue_ant is not None:
             antennas = cue_ant
         try:
-            mini.set_target(head=head_pose(pitch_deg=tp + sway_pitch + cue_pitch, yaw_deg=ty + sway_yaw),
-                            antennas=antennas,
-                            body_yaw=math.radians(body))
+            mini.set_target(
+                head=head_pose(pitch_deg=tp + sway_pitch + cue_pitch + breath + think_pitch_off,
+                               yaw_deg=ty + sway_yaw,
+                               roll_deg=think_roll),
+                antennas=antennas,
+                body_yaw=math.radians(body))
         except Exception:
             time.sleep(1.0)
         time.sleep(dt)
@@ -2353,6 +2607,11 @@ def main() -> int:
     no_gate = "--no-gate" in _args                      # M1.5-a:关方向门控 = 全向(对比/排错)
     no_switch = "--no-switch" in _args                  # M1.5-b:关二次唤醒切换(对比/排错)
     no_sticky = "--no-sticky" in _args                  # M1.5-c:关粘滞选脸 = 每帧 argmax 最大脸(对比/排错)
+    no_easing = "--no-easing" in _args                  # M3-a:关缓动曲线,回退 sin 包络
+    no_breathe = "--no-breathe" in _args                # M3-a:关全态呼吸
+    no_variation = "--no-variation" in _args            # M3-a:关 cue 微变异
+    no_expression = "--no-expression" in _args          # M3-b:关表情/思考反应
+    no_memory = "--no-memory" in _args                  # M3-c:关记忆系统
     for a in _args:                                      # --cue-heard-pitch=8 等,调确认动作幅度/时长
         if a.startswith("--cue-") and "=" in a:
             _k, _v = a[6:].split("=", 1)
@@ -2369,6 +2628,11 @@ def main() -> int:
     log(f"模型:{MODEL}|semantic_vad|16k上行|24k→16k下行|8 动作 + 看图 + 指向 + 逗它|五层仲裁(手势/指向>逗它>声源>跟随>微动)")
 
     st = State()
+    st.no_easing = no_easing
+    st.no_breathe = no_breathe
+    st.no_variation = no_variation
+    st.no_expression = no_expression
+    st.no_memory = no_memory
     play_q: "queue.Queue" = queue.Queue()
     motion_q: "queue.Queue" = queue.Queue()
     snap_q: "queue.Queue" = queue.Queue()
@@ -2417,6 +2681,23 @@ def main() -> int:
                         time.sleep(0.05)
             log(f"摄像头:{'✅ 出帧 ' + str(warm.shape) if warm is not None else '⚠ 10s 无帧(跟随/take_snapshot 可能失败)'}")
 
+            # M3-c 记忆注入:启动时加载已有画像和记忆,拼入 INSTRUCTIONS
+            active_instructions = INSTRUCTIONS
+            active_tools = TOOLS
+            if not no_memory:
+                _profile = load_profile()
+                _mems = load_memories()
+                if _profile or _mems:
+                    _mem_sec = "\n\n--- 你的记忆 ---\n"
+                    if _profile and _profile.get("summary"):
+                        _mem_sec += f"上次对话:{_profile['summary']}\n"
+                    if _mems:
+                        _mem_sec += "记住的事:\n" + "\n".join(f"- {m['content']}" for m in _mems[-20:]) + "\n"
+                    active_instructions += _mem_sec
+                    log(f"📝 已加载记忆({len(_mems)} 条记忆" + (", 有画像" if _profile else "") + ")")
+            else:
+                active_tools = [t for t in TOOLS if t["name"] not in ("remember", "forget")]
+
             callback = ChatCallback(st, play_q, motion_q, snap_q, mini)
 
             def open_session(timeout: float = CONNECT_TIMEOUT_S):
@@ -2435,8 +2716,8 @@ def main() -> int:
                             enable_input_audio_transcription=True,
                             enable_turn_detection=True,
                             turn_detection_type="semantic_vad",
-                            instructions=INSTRUCTIONS,
-                            tools=TOOLS,
+                            instructions=active_instructions,
+                            tools=active_tools,
                         )
                     except Exception as e:
                         holder["err"] = e
@@ -2666,6 +2947,18 @@ def main() -> int:
                     mini.goto_target(INIT_HEAD_POSE, antennas=INIT_ANTENNAS, duration=1.5, body_yaw=0.0)
                 except Exception:
                     pass
+                # M3-c 退出时被动摘要:用廉价模型把对话浓缩成画像
+                if not no_memory:
+                    with st.lock:
+                        _conv_log = list(st.conversation_log)
+                    if _conv_log:
+                        log("📝 生成对话摘要…")
+                        _profile = summarize_conversation(oai, _conv_log)
+                        if _profile:
+                            save_profile(_profile)
+                            log(f"📝 已保存用户画像到 {PROFILE_PATH}")
+                        else:
+                            log("📝 对话太短,跳过摘要")
                 log("已释放 Realtime 连接与 Reachy 媒体资源。")
         finally:
             try:
