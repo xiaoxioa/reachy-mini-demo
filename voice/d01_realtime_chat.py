@@ -297,6 +297,7 @@ ST_PLAYING = "PLAYING"     # 逗它中:头跟手 + 天线开心摆(手势/指向
 PLAY_SIZE_ON = 0.30        # 手 bbox 最大边占画面比 ≥ 此值(够近)才可进入
 PLAY_SIZE_OFF = 0.22       # 跟踪/保持下限(迟滞;更小的"手"= 背景误检,源头过滤)
 PLAY_SCORE_MIN = 0.6       # handedness score 当置信度(真手>0.9,背景误检<0.6)
+PLAY_HAND_V_MAX = 0.80     # 手中心 v ≤ 此值才接受:v>0.80 是画面底部(桌面/衣物误检区)
 PLAY_ON_S = 0.3            # 持续够大才进入(防路过挥手误触)
 PLAY_OFF_S = 1.5           # 近手消失持续此值才退出(手怼太近检测会连丢 1s+)
 PLAY_FRESH_S = 0.4         # 手读数"新鲜"判定
@@ -1272,10 +1273,13 @@ def vision_result_loop(st: State, result_q, stop: threading.Event) -> None:
         hand = msg.get("hand")
         hand_near = False
         if hand is not None:
-            hand_near = (hand.get("score", 1.0) >= PLAY_SCORE_MIN
+            _hv = hand.get("v", 0.5)
+            _valid_pos = _hv <= PLAY_HAND_V_MAX   # 底部区域(桌面/衣物)误检过滤
+            hand_near = (_valid_pos
+                         and hand.get("score", 1.0) >= PLAY_SCORE_MIN
                          and hand.get("size", 0.0) >= PLAY_SIZE_OFF)  # 双门:背景误检不入
             with st.lock:
-                if hand.get("score", 1.0) >= PLAY_SCORE_MIN:  # 低分假手不发布指向
+                if _valid_pos and hand.get("score", 1.0) >= PLAY_SCORE_MIN:  # 低分/底部假手不发布指向
                     st.finger_angle = hand["angle"]
                     st.finger_extended = hand["extended"]
                     st.finger_at = now
@@ -1504,9 +1508,9 @@ def vis_debug_server(st: State, port: int, stop: threading.Event) -> None:
             half = hsize * max(W, H) / 2
             hx0, hy0 = int(hu * W - half), int(hv * H - half)
             hx1, hy1 = int(hu * W + half), int(hv * H + half)
-            valid = hscore >= PLAY_SCORE_MIN and hsize >= PLAY_SIZE_OFF
+            valid = hscore >= PLAY_SCORE_MIN and hsize >= PLAY_SIZE_OFF and hv <= PLAY_HAND_V_MAX
             color = (0, 200, 0) if valid else (0, 200, 255)  # 绿 / 黄
-            tag = "HAND" if valid else "HAND(LOW)"
+            tag = "HAND" if valid else ("HAND(BOT)" if hv > PLAY_HAND_V_MAX else "HAND(LOW)")
             _cv2.rectangle(bgr, (hx0, hy0), (hx1, hy1), color, 2)
             fingers = h.get("fingers", -1)
             gesture = h.get("gesture") or ""
@@ -1706,8 +1710,11 @@ canvas{display:block;margin:0 auto}
 .ev.ev-hl .ety{color:#818cf8}
 .ev.ev-dim{opacity:.28}
 /* timeline canvas */
-#timeline-wrap{grid-column:1/3;background:var(--card);border:1px solid var(--bdr);border-radius:8px;overflow:hidden;position:relative}
-#timeline{width:100%;height:100%}
+#timeline-wrap{grid-column:1/3;background:var(--card);border:1px solid var(--bdr);border-radius:8px;overflow:hidden;position:relative;display:flex;flex-direction:column}
+#tl-lanes{position:absolute;left:0;top:0;bottom:0;width:44px;background:var(--card);z-index:2;border-right:1px solid var(--bdr);pointer-events:none}
+#tl-scroll{flex:1;overflow-x:auto;overflow-y:hidden;position:relative;padding-left:44px;cursor:grab}
+#tl-scroll:active{cursor:grabbing}
+#timeline{display:block;height:100%}
 /* feedback bar */
 #fb-bar{grid-column:1/3;background:var(--card);border:1px solid var(--bdr);border-radius:8px;
         display:flex;align-items:center;gap:10px;padding:0 14px}
@@ -1773,7 +1780,10 @@ canvas{display:block;margin:0 auto}
     </div>
     <div id="ep-list"></div>
   </div>
-  <div id="timeline-wrap"><canvas id="timeline"></canvas></div>
+  <div id="timeline-wrap">
+    <canvas id="tl-lanes"></canvas>
+    <div id="tl-scroll"><canvas id="timeline"></canvas></div>
+  </div>
   <div id="fb-bar">
     <button id="fb-btn" onmousedown="startRec()" onmouseup="stopRec()" ontouchstart="startRec()" ontouchend="stopRec()">🎙️ 按住说反馈 <kbd style="font-size:10px;opacity:.6">[Space]</kbd></button>
     <span id="fb-status">松开后自动 ASR 归档到当前轮次</span>
@@ -1981,93 +1991,156 @@ const LANES=['user','model','tool','system'];
 const LANE_LABELS={'user':'User','model':'Model','tool':'Tool','system':'Sys'};
 const LANE_COLORS={'user':'#38bdf8','model':'#22d3a0','tool':'#f5a623','system':'#6366f1'};
 const LANE_H=36;
-const TL_PAD_L=44,TL_PAD_R=8,TL_PAD_T=6;
-// issue#4: selected node in timeline
-let tlSelNode=null; // {idx, evSeq}
+const TL_LABEL_W=44;   // sticky lane-label column width
+const TL_PAD_R=12, TL_PAD_T=6;
+const TL_MIN_PX=24;    // minimum pixels per event (controls scroll width)
+const TL_DOT_R=4;
+let tlSelNode=null;
+// drag-to-scroll state
+let tlDrag={active:false,startX:0,startScrollLeft:0};
+
+function tlHeight(){return LANES.length*LANE_H+TL_PAD_T*2;}
+
+function drawLaneLabels(){
+  const canvas=$('tl-lanes');
+  const H2=tlHeight();
+  canvas.width=TL_LABEL_W; canvas.height=H2;
+  const c=canvas.getContext('2d');
+  c.fillStyle='#0d0d18'; c.fillRect(0,0,TL_LABEL_W,H2);
+  LANES.forEach((l,i)=>{
+    const y=TL_PAD_T+i*LANE_H+LANE_H/2;
+    c.fillStyle=LANE_COLORS[l]; c.font='9px system-ui';
+    c.textAlign='center'; c.textBaseline='middle';
+    c.fillText(LANE_LABELS[l], TL_LABEL_W/2, y);
+    c.strokeStyle='#1a1a2a'; c.lineWidth=1;
+    c.beginPath(); c.moveTo(0,y+LANE_H/2); c.lineTo(TL_LABEL_W,y+LANE_H/2); c.stroke();
+  });
+}
 
 function drawTimeline(){
+  const wrap=$('tl-scroll');
   const canvas=$('timeline');
-  const W2=canvas.offsetWidth,H2=canvas.offsetHeight;
-  canvas.width=W2;canvas.height=H2;
+  if(!allEvents.length){canvas.width=wrap.clientWidth||400;canvas.height=tlHeight();return;}
+
+  const displayEvs=allEvents.slice(-600);
+  // compute canvas width: enough pixels per event, at least fill container
+  const minW=Math.max(wrap.clientWidth||400, displayEvs.length*TL_MIN_PX+TL_PAD_R);
+  const H2=tlHeight();
+  canvas.width=minW; canvas.height=H2;
+
   const c=canvas.getContext('2d');
-  c.fillStyle='#09090f';c.fillRect(0,0,W2,H2);
-  if(!allEvents.length)return;
-  // Issue#3 fix: always use FULL allEvents time range for axis, not filtered
+  c.fillStyle='#09090f'; c.fillRect(0,0,minW,H2);
+
   const allMono=allEvents.map(e=>e.ts_mono);
   const t0_full=Math.min(...allMono), t1_full=Math.max(...allMono);
   const span=Math.max(t1_full-t0_full,1);
-  const cw=W2-TL_PAD_L-TL_PAD_R;
-  const tx=t=>TL_PAD_L+((t-t0_full)/span)*cw;
+  const cw=minW-TL_PAD_R;
+  const tx=t=>((t-t0_full)/span)*cw;
 
   const filteredSeqs=filterTurnId!=null
     ?(()=>{const turn=allTurns.find(t=>t.turn_id===filterTurnId);return turn?new Set(turn.events):new Set();})()
     :null;
 
-  // draw turn backgrounds
+  // draw turn background bands
   allTurns.forEach(turn=>{
     const ts=turn.start_mono, te=turn.end_mono||t1_full;
     const x0=tx(ts), x1=tx(te);
-    const isSelected=(turn.turn_id===filterTurnId);
-    c.fillStyle=isSelected?'rgba(56,189,248,.07)':'rgba(255,255,255,.02)';
+    const isSel=(turn.turn_id===filterTurnId);
+    c.fillStyle=isSel?'rgba(56,189,248,.08)':'rgba(255,255,255,.015)';
     c.fillRect(x0,0,Math.max(x1-x0,2),H2);
-    if(isSelected){c.strokeStyle='rgba(56,189,248,.2)';c.lineWidth=1;c.beginPath();c.moveTo(x0,0);c.lineTo(x0,H2);c.stroke();}
+    if(isSel){
+      c.strokeStyle='rgba(56,189,248,.3)'; c.lineWidth=1;
+      c.beginPath(); c.moveTo(x0,0); c.lineTo(x0,H2); c.stroke();
+    }
   });
 
-  // lane labels + lines
-  LANES.forEach((l,i)=>{
+  // draw lane horizontal lines
+  LANES.forEach((_,i)=>{
     const y=TL_PAD_T+i*LANE_H+LANE_H/2;
-    c.fillStyle=LANE_COLORS[l];c.font='9px system-ui';c.textAlign='left';c.textBaseline='middle';
-    c.fillText(LANE_LABELS[l],2,y);
-    c.strokeStyle='#1a1a2a';c.lineWidth=1;c.beginPath();c.moveTo(TL_PAD_L,y);c.lineTo(W2-TL_PAD_R,y);c.stroke();
+    c.strokeStyle='#1a1a2a'; c.lineWidth=1;
+    c.beginPath(); c.moveTo(0,y); c.lineTo(minW,y); c.stroke();
   });
 
-  // draw events and build tlNodes
+  // draw time tick marks every ~60px
+  const tickInterval=Math.max(1,(span/(cw/60)));
+  c.fillStyle='#374151'; c.font='8px monospace'; c.textAlign='center'; c.textBaseline='bottom';
+  for(let t=t0_full;t<=t1_full;t+=tickInterval){
+    const x=tx(t);
+    c.fillStyle='#1e1e2e'; c.fillRect(x-0.5,0,1,H2);
+    const s=((t-t0_full));
+    c.fillStyle='#4b5563'; c.fillText(s.toFixed(0)+'s',x,H2);
+  }
+
+  // draw events
   tlNodes=[];
-  const displayEvs=allEvents.slice(-300);
   displayEvs.forEach(e=>{
-    const li=LANES.indexOf(e.role);if(li<0)return;
-    const x=tx(e.ts_mono),y=TL_PAD_T+li*LANE_H+LANE_H/2;
+    const li=LANES.indexOf(e.role); if(li<0)return;
+    const x=tx(e.ts_mono), y=TL_PAD_T+li*LANE_H+LANE_H/2;
     const inFilter=!filteredSeqs||filteredSeqs.has(e.seq);
     const isSelNode=tlSelNode&&tlSelNode.evSeq===e.seq;
-    const r=isSelNode?6:4;
-    c.globalAlpha=inFilter?1.0:0.2;
+    const r=isSelNode?TL_DOT_R+2:TL_DOT_R;
+    c.globalAlpha=inFilter?1.0:0.18;
     c.fillStyle=inFilter?LANE_COLORS[e.role]:'#374151';
-    c.beginPath();c.arc(x,y,r,0,Math.PI*2);c.fill();
-    if(isSelNode){c.strokeStyle='#fff';c.lineWidth=1.5;c.beginPath();c.arc(x,y,r+2,0,Math.PI*2);c.stroke();}
+    c.beginPath(); c.arc(x,y,r,0,Math.PI*2); c.fill();
+    if(isSelNode){
+      c.strokeStyle='#fff'; c.lineWidth=1.5;
+      c.beginPath(); c.arc(x,y,r+2,0,Math.PI*2); c.stroke();
+    }
     c.globalAlpha=1.0;
-    if(cw/Math.max(displayEvs.length,1)>28){
-      c.fillStyle=inFilter?'#9ca3af':'#374151';c.font='8px monospace';c.textAlign='center';c.textBaseline='top';
+    // label if enough space
+    const density=cw/Math.max(displayEvs.length,1);
+    if(density>20){
+      c.fillStyle=inFilter?'#9ca3af':'#374151';
+      c.font='8px monospace'; c.textAlign='center'; c.textBaseline='top';
       c.fillText(e.label.slice(0,10),x,y+r+2);
     }
     tlNodes.push({idx:tlNodes.length, evSeq:e.seq, x, y, role:e.role, laneIdx:li, event:e});
   });
+  drawLaneLabels();
+  // auto-scroll to keep latest events visible (only if already at right edge)
+  const atRight=wrap.scrollLeft>=wrap.scrollWidth-wrap.clientWidth-40;
+  if(atRight) wrap.scrollLeft=wrap.scrollWidth;
 }
 
-// Issue#4: timeline click → scroll to turn card + highlight
+// timeline click → find nearest node
 $('timeline').addEventListener('click',function(ev){
+  const scroll=$('tl-scroll');
   const rect=this.getBoundingClientRect();
-  const mx=ev.clientX-rect.left, my=ev.clientY-rect.top;
+  const mx=ev.clientX-rect.left+scroll.scrollLeft, my=ev.clientY-rect.top;
   let best=null, bestD=Infinity;
   tlNodes.forEach(n=>{
     const d=Math.hypot(n.x-mx,n.y-my);
     if(d<bestD){bestD=d;best=n;}
   });
-  if(!best||bestD>14)return;
+  if(!best||bestD>18)return;
   tlSelNode=best;
-  // find which turn this event belongs to
   const turn=allTurns.find(t=>t.events.includes(best.evSeq));
   if(turn){
     selectTurn(turn.turn_id);
-    // scroll turn card into view
     const card=document.querySelector(`.turn-card[data-tid="${turn.turn_id}"]`);
     if(card)card.scrollIntoView({behavior:'smooth',block:'nearest'});
   } else {
-    // system/vis event not in any turn — just highlight in event list
     document.querySelectorAll('.ev').forEach(el=>el.classList.toggle('hl',+el.dataset.seq===best.evSeq));
     drawTimeline();
   }
   drawTimeline();
 });
+
+// drag-to-scroll on tl-scroll
+(()=>{
+  const s=$('tl-scroll');
+  s.addEventListener('mousedown',ev=>{
+    tlDrag={active:true,startX:ev.clientX,startScrollLeft:s.scrollLeft};
+    s.style.cursor='grabbing';
+  });
+  window.addEventListener('mousemove',ev=>{
+    if(!tlDrag.active)return;
+    s.scrollLeft=tlDrag.startScrollLeft-(ev.clientX-tlDrag.startX);
+  });
+  window.addEventListener('mouseup',()=>{
+    if(tlDrag.active){tlDrag.active=false;$('tl-scroll').style.cursor='grab';}
+  });
+})();
 
 // Issue#4: arrow key navigation on timeline
 document.addEventListener('keydown',function(e){
@@ -2076,7 +2149,6 @@ document.addEventListener('keydown',function(e){
   if(!convActive||!tlNodes.length)return;
   if(e.code==='ArrowLeft'||e.code==='ArrowRight'){
     e.preventDefault();
-    // navigate events on same lane
     const curLane=tlSelNode?tlSelNode.laneIdx:0;
     const sameLane=tlNodes.filter(n=>n.laneIdx===curLane);
     if(!sameLane.length)return;
@@ -2087,12 +2159,10 @@ document.addEventListener('keydown',function(e){
     if(next){tlSelNode=next;scrollToTlNode(next);drawTimeline();}
   } else if(e.code==='ArrowUp'||e.code==='ArrowDown'){
     e.preventDefault();
-    // navigate lanes
     const curLane=tlSelNode?tlSelNode.laneIdx:0;
     const nextLane=e.code==='ArrowDown'?Math.min(curLane+1,LANES.length-1):Math.max(curLane-1,0);
     const laneEvs=tlNodes.filter(n=>n.laneIdx===nextLane);
     if(!laneEvs.length)return;
-    // jump to closest event in time
     const curMono=tlSelNode?tlSelNode.event.ts_mono:(allEvents[0]||{ts_mono:0}).ts_mono;
     const next=laneEvs.reduce((a,b)=>Math.abs(b.event.ts_mono-curMono)<Math.abs(a.event.ts_mono-curMono)?b:a);
     if(next){tlSelNode=next;scrollToTlNode(next);drawTimeline();}
@@ -2103,10 +2173,14 @@ document.addEventListener('keyup',function(e){
 });
 
 function scrollToTlNode(node){
-  // scroll event list to show this event
+  // scroll timeline canvas to show selected node
+  const scroll=$('tl-scroll');
+  const visLeft=scroll.scrollLeft, visRight=scroll.scrollLeft+scroll.clientWidth;
+  if(node.x<visLeft+60||node.x>visRight-60){
+    scroll.scrollLeft=Math.max(0,node.x-scroll.clientWidth/2);
+  }
   const el=document.querySelector(`.ev[data-seq="${node.evSeq}"]`);
   if(el)el.scrollIntoView({behavior:'smooth',block:'nearest'});
-  // also navigate to turn if possible
   const turn=allTurns.find(t=>t.events.includes(node.evSeq));
   if(turn){
     const card=document.querySelector(`.turn-card[data-tid="${turn.turn_id}"]`);
