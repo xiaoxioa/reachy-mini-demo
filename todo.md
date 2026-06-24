@@ -12,9 +12,15 @@
 
 ---
 
-## 1. 唤醒 DOA 能力优化 ❌
+## 1. 唤醒 DOA 能力优化 ⚠️
 
 **问题**: 唤醒后经常转到相反方向或不动，怀疑多人脸/手跟踪逻辑干扰。
+
+**已修复(二次唤醒优先级)**:
+- 替换 `_is_A` DOA 方向门控为 `a_active`(A 正在说话/机器人正回应 → 屏蔽 B；A 沉默 → 响应 B)
+- `voice/state.py` 新增 `user_speaking` flag
+- 在 `speech_started`/`speech_stopped` 事件维护 `user_speaking`
+- 详细分析见 `docs/WAKEWORD_PRIORITY_ANALYSIS.md`
 
 **现状**:
 - DOA 已有 IQR 置信度滤波 + 多层回退 (confident→coarse→mirror/stale→visual SEEK)
@@ -25,6 +31,7 @@
 - [ ] 排查唤醒时 DOA 角度是否被视觉跟踪目标覆盖
 - [ ] 确认多人脸场景下 FaceSelector sticky 选择是否干扰 DOA 转向
 - [ ] 检查 DOA→head_control 的优先级仲裁是否正确
+- [ ] **嘈杂环境 DOA 过滤**: 纯方向一致性窗口漏检风险高(短句/转头/多人同说都会被误过滤); 更好的方案是 DOA+视觉联合判定 — DOA 指向有人脸的方向时置信度加成,指向无人脸的方向时降权/忽略; 视觉跟踪为主、DOA 为辅
 
 ---
 
@@ -257,35 +264,16 @@ python tests/vision_model_test.py --skip-face             # 只测手部+手势
 
 # 13. 当我说”这个人叫xxx”同时有指向手势的时候，记忆也应该更新这个人的信息
 
-## 14. 记忆注入过时 — 切人后旧记忆污染上下文 ❌
+## 14. 记忆注入过时 — 切人后旧记忆污染上下文 ✅
 
-**问题**：当多人交替出现时，记忆注入使用 `conv.create_item(system message)` 只增不删，导致 Qwen session context 中同时存在多个人的记忆信息，模型受旧记忆污染。
+**已修复**: 用 `update_session(instructions=...)` 替代 `create_item(system message)`
 
-**复现路径**：
-1. 用户A 说”我叫大大” → robot 注入 A 的记忆 system message
-2. Robot 转头看到用户B，B 说”我叫陛下” → 注入 B 的记忆 system message
-3. Robot 转回用户A → 再注入 A 的记忆 system message
-4. 此时 context 中有 [A记忆] [B记忆] [A记忆]，模型可能回答陛下相关内容
-
-**根因**：`conv.create_item` 只能添加 conversation item，无法删除旧的。
-
-**修复方案：用 `update_session(instructions=...)` 替代 `create_item`**
-
-Qwen Realtime SDK 的 `update_session()` 可以 mid-session 调用，`instructions` 通过 kwargs 传入。
-将记忆嵌入 session-level instructions 而非独立 system message：
-
-1. 不再用 `conv.create_item({“role”:”system”})` 注入记忆
-2. 改为 `conv.update_session(instructions=INSTRUCTIONS + “\n\n” + memory_prompt)`
-3. 人切换时再次 `update_session` → instructions 被整体替换，旧记忆自动消失
-
-**改动文件**：
-- `voice/d01_realtime_chat.py`：新增 `_update_instructions_with_memory()` helper，替换 line 1972-1976 和 2000-2004 的 `create_item`
-- `voice/state.py`：新增 `identity_injected_pid: str | None = None` 追踪已注入哪个人
-
-**风险**：
-- 需确认 `update_session` mid-session 调用是否中断当前 response
-- 需确认是否触发 `session.updated` 事件导致重复等待
-- `update_session` 需要重传所有参数(voice/audio_format 等)，需缓存 session 配置
+**改动**:
+- `voice/d01_realtime_chat.py`: 新增 `_update_memory_instructions()` helper,调用 `conv.update_session` 将记忆嵌入 session instructions
+- 两处记忆注入(greet-time + late injection)从 `conv.create_item(system)` 改为 `_update_memory_instructions()`
+- 切人时 session instructions 整体替换,旧记忆自动消失(不再只增不删)
+- `voice/state.py`: 新增 `identity_injected_pid` 追踪当前已注入哪个人的记忆
+- `session.updated` 回调区分初始配置 vs 记忆更新(不再重复打印冗长日志)
 
 ## 15. 记忆权限 + 认主机制 ✅
 
@@ -306,3 +294,96 @@ Qwen Realtime SDK 的 `update_session()` 可以 mid-session 调用，`instructio
 | clear_memory(自己) | ✅ | ✅ |
 | forget_fact(他人) | ✅ | ❌ |
 | clear_memory(他人) | ✅ | ❌ |
+
+## 16. TRACKING 态身体不跟随 — 人走到侧面头卡住 ✅
+
+**已修复**：视觉积分中检测 `track_yaw` 逼近颈限(70%)时主动推 `body_yaw_deg` 跟随。
+
+**改动**：
+- `voice/config.py`: 新增 `BODY_FOLLOW_THRESHOLD=0.7`、`BODY_FOLLOW_SPEED_DPS=45.0`
+- `voice/d01_realtime_chat.py`: TRACKING 积分块中，当 `|neck_off| > NECK_REL_LIMIT × 0.7` 时以 45°/s 转体
+- 身体转后颈限范围扩大，头可继续追踪；锁脸默认把人居中
+- 身体限幅 `±BODY_LIMIT_DEG(90°)`
+
+## 17. 人脸误识别稳定性 ✅
+
+**已修复**：身份切换增加迟滞(hysteresis),防止低 sim 抖动误切。
+
+**改动**：
+- `voice/d01_realtime_chat.py` vision_result_loop: 当已跟踪人 A 时,切到 B 需满足:
+  - sim >= 0.65 → 立即切换(高可信)
+  - sim < 0.65 → 需连续 2 次识别都匹配 B 才切换(约 4s)
+- 防止了日志中 sim=0.45~0.51 的低置信匹配立即触发记忆注入错误人
+
+## 18. 视觉工具(take_snapshot/identify_pointed_object)调用报错 ❌
+
+**问题**：用户报告视觉工具调用有 error。
+
+**现状**：当前 `log/main.log` 中未发现视觉工具调用(工具已注册但未触发)。daemon.log 中也无相关错误。需复现后再排查。
+
+**排查方向**：
+- [ ] 复现:让模型调用 take_snapshot,观察日志
+- [ ] 检查 snapshot_loop 线程是否正常运行
+- [ ] 检查 VLM 调用(dashscope multimodal)的网络/API 错误
+
+---
+
+## 19. 切人后记忆注入错误 — prompt 显示错人名字 ✅
+
+**已修复**：close_session 现在清除 current_person_id/name，防止 late injection 用旧人的记忆注入新 session。
+
+**改动**：
+- `voice/d01_realtime_chat.py` close_session: 先提取 `_close_pid` 用于异步摘要，然后清除 `current_person_id/name/is_owner`
+- 根因: close_session 重置了 `identity_injected=False` 但未清 `current_person_id`，late injection 用旧 pid 注入了错人记忆
+
+---
+
+## 20. take_snapshot 时延过长 — 环境已变化 ❌
+
+**问题**：调用 take_snapshot 时，VLM 推理时间过长(网络 RTT + 模型推理)，返回描述时机器人面前的环境早已变化，导致回复与实际不符。
+
+**排查方向**：
+- [ ] 测量 take_snapshot 端到端延迟(从调用到返回)
+- [ ] 考虑: 预抓帧(用最近的 latest_frame 而非调用时才抓) — 当前是否已如此?
+- [ ] 考虑: VLM 模型从 qwen-vl-max 降级到更快的 qwen-vl-plus，或用更小分辨率
+- [ ] 考虑: 异步 snapshot — 先回复"让我看看"，VLM 结果后再追加说明
+
+---
+
+## 21. conversation_log Dashboard 每轮相同 — 未正确记录/展示 ✅
+
+**已修复**：新增 `display_transcript` 持久记录本，不被摘要/close_session 清除。
+
+**改动**：
+- `voice/state.py`: 新增 `display_transcript: list[dict]`，每条包含 ts/role/text/pid/name
+- `voice/d01_realtime_chat.py`: ASR 和 assistant transcript 均追加到 display_transcript（独立于 no_memory 设置）
+- `voice/debug_server.py`: state 端点返回 display_transcript[-50:]，JS 按时间线渲染带角色图标+人名标签
+
+**根因**：原 `conversation_log` 同时用于摘要生成和 Dashboard 显示，close_session 和 auto-summary 均会清空桶，导致 Dashboard 常显示空/旧数据。
+
+---
+
+## 22. Dashboard 人脸框显示 "???" — OpenCV 中文渲染问题 ✅
+
+**已修复**：用 PIL ImageDraw + STHeiti 字体渲染中文文字，fallback 到 cv2.putText。
+
+**改动**：
+- `voice/debug_server.py`: 新增 `_init_pil_fonts()` + `_put_cjk_text()` helper
+- 身份标签渲染从 cv2.putText 改为 _put_cjk_text，支持 CJK 字符
+---
+
+## 23. 记忆索引重名冲突 — person_id 唯一性问题 ❌
+
+**问题**：当前 memory 以 person_id 为主键，但不同人可能被分配到相同或相似的 id，导致记忆索引错误、取到别人的记忆。
+
+**现状**：
+- `identity/recognizer.py` 中 person_id 由 ArcFace embedding 生成（hash）
+- `memory/manager.py` 以 person_id 为 key 存取 `data/memories/<pid>.json`
+- `remember_fact(key="name")` 更新 face_db 中的 display name，但 pid 本身不含 name 信息
+- 如果两个人的 embedding 碰撞或被误合并，记忆会串
+
+**方案方向**：
+- [ ] 索引主键改为复合键（如 name + embedding hash），确保唯一性
+- [ ] 或在 pid 生成时引入更多区分度（embedding 维度、时间戳等）
+- [ ] 排查 auto_merge 是否在双命名保护下仍有误合并风险
+- [ ] 考虑加 pid 冲突检测：新人入库时校验是否与已有 pid 重复
