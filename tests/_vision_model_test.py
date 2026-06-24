@@ -80,13 +80,17 @@ def ts() -> str:
 #  MediaPipe 后端：复刻 vision_worker.py 的「生产」landmarker 参数
 # ══════════════════════════════════════════════════════════════════
 def create_face_landmarker():
-    """与 vision_worker.vision_worker() 中一致：num_faces=2, VIDEO 模式。"""
+    """与 vision_worker.vision_worker() 中一致：num_faces=2, VIDEO 模式, 低阈值。"""
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision as mp_vision
     return mp_vision.FaceLandmarker.create_from_options(
         mp_vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL_PATH),
-            running_mode=mp_vision.RunningMode.VIDEO, num_faces=2))
+            running_mode=mp_vision.RunningMode.VIDEO, num_faces=2,
+            min_face_detection_confidence=0.3,
+            min_face_presence_confidence=0.3,
+            min_tracking_confidence=0.3,
+            output_face_blendshapes=True))
 
 
 def create_hand_landmarker():
@@ -346,9 +350,11 @@ def run_live(max_seconds: float = 20.0, save_every: int = 30) -> int:
 
     os.makedirs(OUT_DIR, exist_ok=True)
     DECIMATE = 3
+    STAT_INTERVAL = 10  # 每 N 帧打印一次滚动统计
     frame_idx = saved = 0
     face_hits = hand_hits = 0
     gesture_counts: dict = {}
+    face_sizes: list = []
     t_start = time.monotonic()
     last_ts = -1
 
@@ -368,10 +374,12 @@ def run_live(max_seconds: float = 20.0, save_every: int = 30) -> int:
                 rgb = np.ascontiguousarray(raw[::DECIMATE, ::DECIMATE, ::-1])
                 frame_idx += 1
                 ts_ms = max(last_ts + 1, int((time.monotonic() - t_start) * 1000))
-                last_ts = ts_ms + 1  # 给手部时间戳留一位
+                last_ts = ts_ms + 1
                 det = det_engine.run_frame(rgb, ts_ms)
-                if det.get("face") is not None:
+                face = det.get("face")
+                if face is not None:
                     face_hits += 1
+                    face_sizes.append(face[2])
                 hand = det.get("hand")
                 if hand is not None:
                     hand_hits += 1
@@ -380,21 +388,30 @@ def run_live(max_seconds: float = 20.0, save_every: int = 30) -> int:
                     gp, gs = gate_status(hand)
                     print(f"{ts()} 👋 score={hand['score']:.2f} size={hand['size']:.2f} "
                           f"gesture={g} fingers={hand.get('fingers')} {gs}")
+                if frame_idx % STAT_INTERVAL == 0:
+                    rate = 100.0 * face_hits / frame_idx
+                    avg_h = np.mean(face_sizes[-STAT_INTERVAL:]) if face_sizes else 0.0
+                    face_str = f"h={face[2]:.3f}" if face else "MISS"
+                    print(f"{ts()} #{'%04d' % frame_idx} {face_str}  "
+                          f"人脸={face_hits}/{frame_idx}({rate:.0f}%)  "
+                          f"近{STAT_INTERVAL}帧均h={avg_h:.3f}  ms={det.get('face_ms',0):.1f}")
                 if frame_idx % save_every == 0:
                     ann = annotate_frame(rgb, det, frame_idx, "mediapipe", title="live")
                     p = os.path.join(OUT_DIR, f"live_{saved:03d}.jpg")
                     Image.fromarray(ann).save(p, "JPEG", quality=85)
                     saved += 1
-                    fps = frame_idx / (time.monotonic() - t_start)
-                    print(f"{ts()} 📸 {p} fps={fps:.1f} 人脸{face_hits}/{frame_idx} 手{hand_hits}")
         except KeyboardInterrupt:
             print("\nCtrl+C 停止")
         finally:
             mini.media.stop_recording()
 
     elapsed = time.monotonic() - t_start
-    print(f"\n=== 统计 ({elapsed:.1f}s, {frame_idx}帧) ===")
+    fps = frame_idx / max(elapsed, 0.01)
+    print(f"\n=== 统计 ({elapsed:.1f}s, {frame_idx}帧, {fps:.1f}fps) ===")
     print(f"  人脸检出: {face_hits}/{frame_idx} ({100*face_hits/max(frame_idx,1):.0f}%)")
+    if face_sizes:
+        print(f"  人脸尺寸: min={min(face_sizes):.3f} max={max(face_sizes):.3f} "
+              f"avg={np.mean(face_sizes):.3f} (h占比, 越大越近)")
     print(f"  手检出: {hand_hits}  手势分布: {gesture_counts}")
     print(f"  标注图: {OUT_DIR}")
     return 0

@@ -1,37 +1,50 @@
-# 隐私:体检产物(人脸照片 / 录音 / 测试音频)——不上传
-healthcheck/output/
-# 隐私:快照/视觉抓拍(可能含人脸)——不上传
-data/output/
-# 隐私:视觉模型测试夹具(人脸/手)与标注产物——不上传(脚本/manifest/README 仍入库)
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+
+# Runtime / generated
+log/
+log_bak/
+graphify-out/
+nohup.out
+*.pid
+*.whl
+vis.json
+.DS_Store
+
+# 二进制模型(ONNX/MediaPipe/sherpa, 太大不入库)
+models/
+
+# 运行时数据(人脸特征库/记忆/快照, 含隐私)
+data/
+
+# 测试产物与隐私图片
 tests/output/
 tests/fixtures/*.jpg
 
-# 统一模型目录(ONNX/MediaPipe/sherpa 等二进制模型)
-models/
-# 运行时数据(人脸特征库/记忆/快照)
-data/
-# 开发归档(旧版/诊断脚本)
-_archive/
-
-# daemon 运行日志(本地排障用)
-tools/daemon_logs/
-log/
-
-# 唤醒词调研产物(KWS 模型 32MB / 测试 venv / 合成音频 / 脚本草稿)——留磁盘不进库
-tools/_kws*
+# 唤醒词模型与 daemon 日志
+tools/_kws_models/
+tools/_kws*/
 tools/sherpa-onnx-*/
 tools/kws_model.tar.bz2
+tools/daemon_logs/
 tools/err.txt
-
-# Python 缓存
-__pycache__/
-*.pyc
 
 # 本地工具配置
 .claude/
+.codegraph/
+.wolf/
 
-# M3-c 记忆数据(含用户画像/对话记忆,隐私)
-data/
+# 开发归档
+_archive/
 
-# 本地配置（含 API Key，不上传；请复制 .env.example 创建）
-.env
+# 依赖锁文件(可选入库, 但此项目用 uv 按需生成)
+uv.lock

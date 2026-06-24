@@ -1,10 +1,25 @@
-# d01_realtime_chat.py 架构说明(MAIN-01 任务1)
+# voice/ 架构说明(MAIN-01 任务1)
 
-> 2026-06-07。对象:`voice/d01_realtime_chat.py` + `voice/vision_worker.py`(视觉子进程)。
+> 2026-06-23 更新。对象:`voice/` 包(6 模块) + `perception/vision_worker.py`(视觉子进程)。
 > 定位:完整体伴侣机器人 = **传感器层 → 行为状态机(唯一调度)→ 渲染层(唯一硬件写入)**,
 > 单进程多线程 + 1 个视觉子进程。本文是"地图";实现细节与踩坑见 `../CALIBRATION.md` §6-§13。
 
-## 0. 一图流
+## 0. 模块结构
+
+```
+voice/
+├── config.py          # 302行 纯常量 + INSTRUCTIONS + BASE_TOOLS + prompt 模板 + 工具函数
+├── state.py           # 278行 State 类 + OneEuroFilter + log() + 对话事件录制
+├── actions.py         #  92行 head_pose/gpose 矩阵 + act_* 手势动作 + ACTIONS 字典
+├── audio.py           # 144行 DOA 传感器线程 + 播放线程
+├── debug_server.py    #1094行 VIS_DEBUG MJPEG 调试预览 + Conversation Dashboard(只读)
+├── d01_realtime_chat.py #2074行 主程序:ChatCallback + 视觉 + 状态机 + head_control + main
+└── ARCHITECTURE.md    # 本文件
+```
+
+**依赖方向**:`config` ← `state` ← `actions`/`audio`/`debug_server` ← `d01`(单向,无循环)。
+
+## 1. 一图流
 
 ```
                          ┌──────────────────── 传感器层(只感知,不动头)────────────────────┐
@@ -32,7 +47,7 @@
    player_loop(play_q → 扬声器,带 ~300ms 抖动缓冲与代际作废)
 ```
 
-## 1. 四个核心能力 → 代码边界
+## 2. 四个核心能力 → 代码边界
 
 | 能力 | 传感/输入 | 决策 | 执行 | 配置块 |
 |---|---|---|---|---|
@@ -50,26 +65,27 @@
 - MediaPipe VIDEO 模式时间戳严格递增;Face/Hand 共用单调时钟(vision_worker)。
 - 设备独占:全程只有 frame_pump 一个 get_frame 者、main 一个 get_audio_sample 者;take_snapshot 读共享帧。
 
-## 2. 线程/进程清单
+## 3. 线程/进程清单
 
-| 名字 | 周期 | 职责 | 读 | 写 |
-|---|---|---|---|---|
-| main 主循环 | 阻塞拉流 | 麦克风 16k chunk → Realtime 上行;到时退出 | mini.media | conv |
-| ChatCallback.on_event | 事件驱动 | 服务端事件分发:打断/工具/音频/计时器喂养 | st | play_q/motion_q/snap_q、st.point_request(经 snap judge) |
-| player_loop | 队列驱动 | 抖动缓冲 + 代际作废 + 推扬声器 | play_q | st.playback_end_estimate |
-| motion_loop | 队列驱动 | Primary 手势串行 goto(以跟随姿态为基准) | motion_q | st.action_active |
-| snapshot_loop | 队列驱动 | 共享帧→jpg→Qwen-VL;mode=scene/judge/point;judge 可升级 point_request | snap_q、st.latest_frame | st.snap_grabbed/snapshot_pending/point_request、conv |
-| frame_pump_loop | ~40Hz | 唯一抓帧者;共享原帧;降采样喂子进程(drop-old) | mini.media | st.latest_frame、mp.Queue |
-| **vision_worker(子进程)** | 每帧 | Face 每帧(pick_main_face 取最大脸)+ Hand 自适应提频 | mp.Queue | result_q |
-| vision_result_loop | 队列驱动 | 发布 face/hand/finger;TRACKING 积分跟脸;PLAYING 积分跟手 | result_q、st.state | st.face_*/hand_*/finger_*、st.track_yaw/pitch |
-| **KwsGate(在 main 主循环内)** | 每音频块 | 本地唤醒词检测(sherpa-onnx,armed/engaged 都喂) | 16k mono | (返回命中 bool) |
-| doa_sensor_loop | 10Hz | DOA 中值滤波 + 自声门控 → 视场外残差 | REST、st.playback_end_estimate | st.sound_resid/sound_at |
-| behavior_loop | 25Hz | 状态机唯一调度(见 §3) | st.* | st.state、track/body 目标、point_request 消费 |
-| head_control_loop | 25Hz | 唯一 set_target:track 目标+微动+天线 | st.* | 硬件 |
+| 名字 | 所在模块 | 周期 | 职责 | 读 | 写 |
+|---|---|---|---|---|---|
+| main 主循环 | d01 | 阻塞拉流 | 麦克风 16k chunk → Realtime 上行;到时退出 | mini.media | conv |
+| ChatCallback.on_event | d01 | 事件驱动 | 服务端事件分发:打断/工具/音频/计时器喂养 | st | play_q/motion_q/snap_q、st.point_request(经 snap judge) |
+| player_loop | audio.py | 队列驱动 | 抖动缓冲 + 代际作废 + 推扬声器 | play_q | st.playback_end_estimate |
+| motion_loop | d01 | 队列驱动 | Primary 手势串行 goto(以跟随姿态为基准) | motion_q | st.action_active |
+| snapshot_loop | d01 | 队列驱动 | 共享帧→jpg→Qwen-VL;mode=scene/judge/point;judge 可升级 point_request | snap_q、st.latest_frame | st.snap_grabbed/snapshot_pending/point_request、conv |
+| frame_pump_loop | d01 | ~40Hz | 唯一抓帧者;共享原帧;降采样喂子进程(drop-old) | mini.media | st.latest_frame、mp.Queue |
+| **vision_worker(子进程)** | perception/ | 每帧 | Face 每帧(pick_main_face 取最大脸)+ Hand 自适应提频 | mp.Queue | result_q |
+| vision_result_loop | d01 | 队列驱动 | 发布 face/hand/finger;TRACKING 积分跟脸;PLAYING 积分跟手 | result_q、st.state | st.face_*/hand_*/finger_*、st.track_yaw/pitch |
+| **KwsGate(在 main 主循环内)** | d01 | 每音频块 | 本地唤醒词检测(sherpa-onnx,armed/engaged 都喂) | 16k mono | (返回命中 bool) |
+| doa_sensor_loop | audio.py | 10Hz | DOA 中值滤波 + 自声门控 → 视场外残差 | REST、st.playback_end_estimate | st.sound_resid/sound_at |
+| behavior_loop | d01 | 25Hz | 状态机唯一调度(见 §4) | st.* | st.state、track/body 目标、point_request 消费 |
+| head_control_loop | d01 | 25Hz | 唯一 set_target:track 目标+微动+天线 | st.* | 硬件 |
+| vis_debug_server | debug_server.py | HTTP | MJPEG 预览 + Conversation Dashboard(只读) | st.*、全局缓冲 | — |
 
 队列:`play_q`(下行音频)、`motion_q`(手势)、`snap_q`(看图任务)、`vis_frame_q`(maxsize=1 背压)、`vis_result_q`。
 
-## 3. 行为状态机(behavior_loop)
+## 4. 行为状态机(behavior_loop)
 
 ```
                  ┌─────────(晃动大手,任何非POINTING态)──────────┐
@@ -103,7 +119,7 @@ engaged 任意态 15s 无互动 → ARMED(关 WS,回零连接零计费;wake_mode
 - 唤醒响应序列:命中 → **heard 上扬(0 延迟)** → 连接 → SEEK 寻人 → 锁脸对话;连接失败 → **fail 下垂**;SEEK 没人 → **giveup 微沉** → 待命。三动作经 head_control 叠加渲染(单槽后到覆盖,additive 可被打断)。
 - SEEK = 视觉主导寻人:**DOA 只取 resid 符号当起扫方向弱提示**,不信角度/不信 spread(spread 只测稳不测对,抓不到镜像错);见脸=锁定。详见 CALIBRATION §14。
 
-## 4. 五层动作仲裁(优先级从高到低)
+## 5. 五层动作仲裁(优先级从高到低)
 
 1. **Primary** 手势 goto / POINTING 转头(behavior 驱动)
 2. **Playing** 逗它跟手(PLAYING 态,视觉积分)
@@ -113,7 +129,7 @@ engaged 任意态 15s 无互动 → ARMED(关 WS,回零连接零计费;wake_mode
 
 实现上 2/4 是"同一支笔两种墨水"(vision_result_loop 按 st.state 选积分目标),1/3 由 motion/behavior 驱动,5 在渲染层叠加——所以不存在抢写。
 
-## 5. 两段式指向(POINT-02 v2,2026-06-07 定稿)
+## 6. 两段式指向(POINT-02 v2,2026-06-07 定稿)
 
 ```
 "这是什么" ─► 模型调 take_snapshot(1.2s内见过伸指→mode=judge)或 identify_pointed_object(恒 judge)
@@ -126,7 +142,7 @@ engaged 任意态 15s 无互动 → ARMED(关 WS,回零连接零计费;wake_mode
 - 方向用 VLM 的粗方向(8 向);本地食指延长线 2D 角度只做"要不要走 judge"的提示(其噪声曾致错误抬头)。
 - snapshot_pending 在工具调用时 +1,judge 升级时**不**减(continue),由 point 轮收尾减——保证 response.done 不抢跑。
 
-## 6. WAKE-01 唤醒词 + 待命门控(M1,已实现;标定/踩坑见 CALIBRATION §14)
+## 7. WAKE-01 唤醒词 + 待命门控(M1,已实现;标定/踩坑见 CALIBRATION §14)
 
 - **唤醒词 = 单字「小艺」**(yī/yìn/yì 三声调形态,sherpa-onnx KWS int8,`--single-thr 0.17`,命中即唤醒)。叠词/双单确认真机实测否决。`KwsGate` 类封装,模型在 `tools/_kws_models/`(gitignore)。
 - **上行两路**:main 主循环同一份 16k mono **始终喂 KWS**(本地、与网络无关);**engaged 才** `append_audio` 给 Qwen,armed `continue` 绝不发上行。
@@ -135,7 +151,7 @@ engaged 任意态 15s 无互动 → ARMED(关 WS,回零连接零计费;wake_mode
 - **SEEK 转向(视觉主导)**:DOA 只取 resid 符号当起扫方向弱提示;从中心慢扫 yaw+pitch,见脸即锁(视觉裁判),镜像错靠"扫两侧+见脸"兜回。**不信 DOA 角度/spread**(详见 §3 + CALIBRATION §14 的两个错误前提推翻)。
 - **DOA 可用区/盲区**:前+左右侧+侧后 ~±150° 方位 DOA 大致可用;深后 ~150-210° 是**双重盲区**(唤醒 ~3/10 + 头转不过 ±90°),软件不可救,人需绕到 ±90° 内。
 
-## 7. 已知边界 / 记账
+## 8. 已知边界 / 记账
 
 - 背景人声 vs 真人对话:**已由 WAKE-01 待命门控根治**(armed 不连 Qwen,电视声不喂 semantic_vad);engaged 内的电视声区分留 M1.5 方向门控。误触地板 ~0.7 次/5min(电视同音,阈值救不了)。
 - 深后方双重盲区(唤醒 ~3/10 + ±90° 物理限);多脸=每帧取最大(无 sticky 迟滞,留 M1.5)。

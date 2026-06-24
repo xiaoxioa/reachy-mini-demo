@@ -79,5 +79,104 @@
       "hand": false,
       "gesture": null
     }
+  },
+  {
+    "file": "face_close.jpg",
+    "expect": {
+      "face": true,
+      "n_faces": 1,
+      "hand": false,
+      "gesture": null
+    }
+  },
+  {
+    "file": "face_mid.jpg",
+    "expect": {
+      "face": true,
+      "n_faces": 1,
+      "hand": false,
+      "gesture": null
+    }
+  },
+  {
+    "file": "face_far.jpg",
+    "expect": {
+      "face": true,
+      "n_faces": 1,
+      "hand": false,
+      "gesture": null
+    }
+  },
+  {
+    "file": "face_yaw_l30.jpg",
+    "expect": {
+      "face": true,
+      "n_faces": 1,
+      "hand": false,
+      "gesture": null
+    }
+  },
+  {
+    "file": "face_yaw_r30.jpg",
+    "expect": {
+      "face": true,
+      "n_faces": 1,
+      "hand": false,
+      "gesture": null
+    }
+  },
+  {
+    "file": "face_yaw_l60.jpg",
+    "expect": {
+      "face": true,
+      "n_faces": 1,
+      "hand": false,
+      "gesture": null
+    }
+  },
+  {
+    "file": "face_yaw_r60.jpg",
+    "expect": {
+      "face": true,
+      "n_faces": 1,
+      "hand": false,
+      "gesture": null
+    }
+  },
+  {
+    "file": "face_pitch_up.jpg",
+    "expect": {
+      "face": true,
+      "n_faces": 1,
+      "hand": false,
+      "gesture": null
+    }
+  },
+  {
+    "file": "face_pitch_down.jpg",
+    "expect": {
+      "face": true,
+      "n_faces": 1,
+      "hand": false,
+      "gesture": null
+    }
+  },
+  {
+    "file": "face_far_yaw_l30.jpg",
+    "expect": {
+      "face": true,
+      "n_faces": 1,
+      "hand": false,
+      "gesture": null
+    }
+  },
+  {
+    "file": "face_far_yaw_r30.jpg",
+    "expect": {
+      "face": true,
+      "n_faces": 1,
+      "hand": false,
+      "gesture": null
+    }
   }
 ]

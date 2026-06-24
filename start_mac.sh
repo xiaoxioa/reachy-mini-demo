@@ -8,11 +8,10 @@ set -euo pipefail
 
 # ── 路径 ────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"          # reachy-mini-demo/
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"         # 项目根目录（含 .venv）
-PYTHON="$PROJECT_ROOT/.venv/bin/python"
-LOG_DIR="$PROJECT_ROOT/log"
-DAEMON_PID="$PROJECT_ROOT/.server.pid"
-MAIN_PID="$PROJECT_ROOT/.main.pid"
+PYTHON="$SCRIPT_DIR/.venv/bin/python"
+LOG_DIR="$SCRIPT_DIR/log"
+DAEMON_PID="$SCRIPT_DIR/.server.pid"
+MAIN_PID="$SCRIPT_DIR/.main.pid"
 MAIN_SCRIPT="$SCRIPT_DIR/voice/d01_realtime_chat.py"
 
 # ── 颜色 ────────────────────────────────────────────────────
@@ -33,6 +32,18 @@ stop_all() {
 }
 
 [ "${1:-}" = "stop" ] && stop_all
+
+# ── 解析参数 ────────────────────────────────────────────────
+for arg in "$@"; do
+  case "$arg" in
+    --face-mp)  export FACE_BACKEND="mediapipe" ;;
+  esac
+done
+if [ "${FACE_BACKEND:-yunet}" = "mediapipe" ]; then
+  info "人脸后端: MediaPipe (--face-mp)"
+else
+  info "人脸后端: YuNet (默认, 用 --face-mp 切换)"
+fi
 
 # ════════════════════════════════════════════════════════════
 echo ""
@@ -98,7 +109,7 @@ export HF_HUB_OFFLINE=1          # 禁止 daemon 访问 HuggingFace 网络
 export NO_PROXY="localhost,127.0.0.1,::1"
 export no_proxy="localhost,127.0.0.1,::1"
 
-nohup "$PROJECT_ROOT/.venv/bin/reachy-mini-daemon" \
+nohup "$SCRIPT_DIR/.venv/bin/reachy-mini-daemon" \
   -p "$SERIAL_PORT" \
   --localhost-only \
   --log-level INFO \
@@ -127,11 +138,9 @@ info "Daemon 就绪，control_mode=enabled ✅"
 # ── 6. 启动主程序 ────────────────────────────────────────────
 info "启动小艺主程序..."
 > "$LOG_DIR/main.log"   # 清空旧日志，防止 grep 命中上次运行的内容
-cd "$SCRIPT_DIR/voice"
-nohup "$PYTHON" -u d01_realtime_chat.py \
+nohup "$PYTHON" -u "$MAIN_SCRIPT" \
   >> "$LOG_DIR/main.log" 2>&1 &
 echo $! > "$MAIN_PID"
-cd "$SCRIPT_DIR"
 info "主程序 PID: $(cat "$MAIN_PID")"
 
 # 等首条就绪日志（NO_VOICE 模式等视觉就绪，否则等语音就绪）
@@ -163,15 +172,16 @@ if [ "${VIS_DEBUG:-0}" = "1" ]; then
 fi
 echo ""
 
-# ── 7. 实时跟进日志（Ctrl+C 停主程序 + daemon）──────────────────
-trap '
+# ── 7. 实时跟进日志（Ctrl+C 或退出时停主程序 + daemon）──────────────
+_cleanup() {
   echo ""
-  info "收到 Ctrl+C，正在停止..."
+  info "正在停止..."
   [ -f "$MAIN_PID" ] && kill "$(cat "$MAIN_PID")" 2>/dev/null && info "主程序已停止"
   sleep 1
   [ -f "$DAEMON_PID" ] && kill "$(cat "$DAEMON_PID")" 2>/dev/null && info "Daemon 已停止 (机器人将进入睡眠)"
-  exit 0
-' INT
+}
+trap '_cleanup; exit 0' INT
+trap '_cleanup' EXIT
 
 # VIS_DEBUG: 后台等日志中出现 Dashboard 行再 open
 if [ "${VIS_DEBUG:-0}" = "1" ]; then
