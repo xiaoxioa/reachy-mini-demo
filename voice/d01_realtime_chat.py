@@ -74,33 +74,18 @@ import collections
 import math
 import multiprocessing
 import queue
+import re
 import sys
 import threading
 import time
-import urllib.request
 import random
 import uuid
 from collections import deque
 from datetime import datetime, timezone
 
-# VIS_DEBUG 日志环形缓冲区（/state.json 消费）
-_vis_log_buf: "deque[tuple[int, str]]" = deque(maxlen=1000)
-_vis_log_seq: int = 0
-
-# 对话可视化缓冲区（Conversation Dashboard）
-_conv_events: "deque[dict]" = deque(maxlen=2000)  # 原始事件流
-_conv_turns: "list[dict]" = []                     # 高层轮次（最近 100 轮）
-_conv_seq: int = 0                                 # 事件全局递增 ID
-_turn_counter: int = 0                             # 轮次编号（人类可读，连续递增）
-_feedback_notes: "list[dict]" = []                # 用户语音反馈归档
-_current_turn: "dict | None" = None               # 当前打开的轮次（response.created 开，response.done 关）
-_feedback_seq: int = 0
-_pending_asr: str = ""                             # ASR 在 response.created 之前到达时的缓冲
-
 import numpy as np
 from PIL import Image
 from scipy.signal import resample_poly
-from scipy.spatial.transform import Rotation as R
 import pytweening
 
 import dashscope
@@ -118,10 +103,64 @@ from reachy_mini import ReachyMini
 from perception.vision_worker import vision_worker as _vision_worker_fn
 
 from identity.recognizer import IdentityRecognizer, IDENTITY_COOLDOWN_S
+from identity.owner import OwnerManager
 from memory.manager import MemoryManager, QWEN_TOOLS
+
+from voice.config import (                          # ← 配置常量集中管理
+    MODEL, VISION_MODEL, VISION_BASE_URL, VOICE, INSTRUCTIONS,
+    SNAP_DIR, _MODELS_DIR, VIS_MODEL_PATH, HAND_MODEL_PATH, GESTURE_MODEL_PATH,
+    _DATA_DIR, PROFILE_PATH, MEMORY_PATH,
+    OUT_SR, PLAY_SR,
+    IDLE_HZ, IDLE_YAW_AMP, IDLE_PITCH_AMP, IDLE_YAW_F, IDLE_PITCH_F, IDLE_TAU,
+    TRACK_SWAY_SCALE,
+    VIS_MAX_FPS, VIS_MISS_N, DECIMATE, FOV_X_DEG, FOV_Y_DEG,
+    TRACK_TAU, TRACK_DEADBAND, TRACK_MAX_STEP, TRACK_YAW_LIMIT, TRACK_PITCH_LIMIT,
+    LOST_HOLD_S, RETURN_TAU, YAW_SIGN, PITCH_SIGN,
+    SND_RESID_MIN, SND_DONE_RESID,
+    DOA_DEBUG, GATE_DEG, DOA_GATE_FRESH_S,
+    SWITCH_COOLDOWN_S, SWITCH_AWAY_DEG, SWITCH_SETTLE, SWITCH_TIMEOUT_S, SWITCH_COARSE_DEG,
+    SND_FACE_FRESH_S, SND_MAX_HOPS, SND_WAIT_FACE_S, SND_COOLDOWN_S,
+    SND_SPEED_DPS, SND_TARGET_LIMIT, BODY_LIMIT_DEG, NECK_REL_LIMIT,
+    ST_ARMED, ST_IDLE, ST_ENGAGING, ST_TRACKING, ST_SEARCHING, ST_RETURNING,
+    ST_POINTING, ST_PLAYING,
+    FACE_FRESH_S, LOCK_WIN, LOCK_ON_RATE, LOCK_OFF_RATE,
+    ENGAGE_TIMEOUT_S, ENGAGE_SCAN_RANGE, ENGAGE_SCAN_TIME_S,
+    SEARCH_TIMEOUT_S, NO_INTERACT_S, FSM_HZ,
+    KWS_MODEL_DIR, KWS_KEYWORDS, KWS_FORMS, KWS_SINGLE_THR, KWS_DEBOUNCE_S,
+    KWS_REFRACTORY_S, CONNECT_TIMEOUT_S,
+    ARMED_BREATH_F, ARMED_BREATH_PITCH, CUE,
+    SPREAD_BAD, WIDE_SCAN_RANGE, WIDE_SCAN_HZ, WIDE_SCAN_TIME_S,
+    DOA_WAKE_FRESH_S, SEEK_PITCH_UP, SEEK_PITCH_AMP, SEEK_PITCH_HZ,
+    SEEK_NEARBY_DEG, SEEK_NEARBY_TIME_S, SEEK_SUPPRESS_DEG,
+    GREET_PHRASES, BYE_PHRASES, EXIT_MIN_S, EXIT_MAX_S,
+    POINT_FRESH_S, POINT_YAW_GAIN, POINT_PITCH_GAIN,
+    POINT_TURN_TIMEOUT_S, POINT_SETTLE_S, POINT_HOLD_MAX_S,
+    PLAY_SIZE_ON, PLAY_SIZE_OFF, PLAY_SCORE_MIN, PLAY_HAND_V_MAX,
+    PLAY_ON_S, PLAY_OFF_S, PLAY_FRESH_S,
+    PLAY_MOVE_WIN_S, PLAY_MOVE_MIN, PLAY_STILL_S,
+    PLAY_TAU, PLAY_MAX_STEP, PLAY_AMP, PLAY_YAW_LIMIT, PLAY_PITCH_LIMIT,
+    PLAY_COAST_S, PLAY_COAST_DU, PLAY_COAST_VEL,
+    PLAY_JOY_DELAY_S, PLAY_JOY_PERIOD_S, PLAY_JOY_FLICK_S, PLAY_REENTRY_S,
+    EASE_ATTACK_FRAC, CUE_VARIATION,
+    THINK_ROLL_AMP, THINK_ROLL_F, THINK_PITCH, THINK_ANT_AMP, THINK_ANT_F,
+    THINK_BLEND_TAU,
+    EXPR_SMILE_ANT, EXPR_FROWN_ANT, EXPR_BLEND_TAU,
+    SUMMARY_MODEL,
+    _NOPARAM, BASE_TOOLS, SNAP_PROMPTS, _DIR_MAP,
+    greet_prompt, parse_judge,
+)
+from voice.state import (                           # ← 共享状态 + 日志 + 录制
+    State, OneEuroFilter, log,
+    _vis_log_buf, _vis_log_seq,
+    _conv_events, _conv_turns, _conv_seq,
+    _feedback_notes, _feedback_seq,
+    _record_event, _record_snap_result, _record_vis_event,
+)
+import voice.state as _st_mod
 
 _id_recognizer: IdentityRecognizer | None = None
 _memory_mgr: MemoryManager | None = None
+_owner_mgr: OwnerManager | None = None
 
 # 仿真模式摄像头源切换:USE_WEBCAM=1 时 frame_pump_loop 从 Mac 摄像头取帧,
 # 绕过 MuJoCo 虚拟摄像头(空棋盘格场景无人脸,人脸检测永远失败)。
@@ -136,526 +175,34 @@ NO_VOICE = os.environ.get("NO_VOICE", "").lower() in ("1", "true", "yes")
 VIS_DEBUG = os.environ.get("VIS_DEBUG", "").lower() in ("1", "true", "yes")
 VIS_DEBUG_PORT = int(os.environ.get("VIS_DEBUG_PORT", "7654"))
 
-# ───────────────────────── 配置 ─────────────────────────
-MODEL = "qwen3.5-omni-flash-realtime-2026-03-15"
-VISION_MODEL = "qwen3.5-omni-plus"   # take_snapshot 看图用(chat.completions 回合制)
-VISION_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-VOICE = "Ethan"
-INSTRUCTIONS = (
-    "你是桌面机器人,名字叫'小艺'(用户给你起的中文名),有真实的身体(头、天线)和一台摄像头。"
-    "别人问你叫什么、喊'小艺'时,你都以小艺自居;不要自称 Reachy Mini(那只是你的硬件型号)。"
-    "用简体中文、口语化、简短地回答,一般不超过两三句话。"
-    "回答时自然地配合动作工具表达身体语言:打招呼/同意时点头,否定时摇头,"
-    "开心/兴奋/被夸时摆天线,好奇/疑惑时歪头。"
-    "重要:做动作时必须同时用语音回应,边说边做;绝不要默默做动作不说话。"
-    "用户让你看东西时调用 take_snapshot,拿到画面描述后用自己的话自然地告诉用户你看到了什么。"
-    "当用户用手指指着某个东西问'这是什么''我指的是什么''这个呢'之类、需要判断他指向哪个物体时,"
-    "调用 identify_pointed_object,拿到结果后自然地说出他指的那个东西。"
-    "【输出格式铁律】回复中绝对不要输出任何XML标签、HTML标签或类似<xxx/>的标记,"
-    "它们会被直接朗读出来。动作请只通过工具调用(function call)来触发,不要写在文字回复里。"
+# ───────────────────────── 组合工具列表 ─────────────────────────
+TOOLS = BASE_TOOLS + QWEN_TOOLS
+
+from voice.actions import (
+    INIT_HEAD_POSE, INIT_ANTENNAS, head_pose, gpose,
+    act_nod, act_shake, _look, act_wiggle, act_tilt, ACTIONS,
 )
+from voice.audio import doa_sensor_loop, _fresh_sound, player_loop
 
-SNAP_DIR = os.path.join(_REPO, "data", "output")  # 快照存放(已 gitignore)
-
-OUT_SR = 24000   # Realtime 下行采样率
-PLAY_SR = 16000  # Reachy 播放管线 appsrc 固定 16kHz
-JITTER_S = 0.30
-JITTER_WALL_S = 0.50
-
-# idle 微动(说话时的"活着感",O-01a-2)
-IDLE_HZ = 25.0
-IDLE_YAW_AMP = 2.5    # 度(无人脸时的原幅度)
-IDLE_PITCH_AMP = 1.5  # 度
-IDLE_YAW_F = 0.20     # Hz
-IDLE_PITCH_F = 0.30   # Hz
-IDLE_TAU = 0.5        # 包络时间常数(s)
-TRACK_SWAY_SCALE = 0.4  # 跟随中微动缩放(小幅叠加,不和跟随打架)
-
-# ── 本地视觉跟随(VIS-01 → F-01 融合,参数与教训见 CALIBRATION §9)──
-_MODELS_DIR = os.path.join(_REPO, "models")
-VIS_MODEL_PATH = os.path.join(_MODELS_DIR, "face_landmarker.task")
-HAND_MODEL_PATH = os.path.join(_MODELS_DIR, "hand_landmarker.task")
-VIS_MAX_FPS = 40.0   # 检测限频(检测在独立进程,不再让主进程分担,放回 40)
-VIS_MISS_N = 5       # 连续 N 帧漏检才算"真丢脸"(单帧漏检不重置滤波,防侧脸闪断)
-DECIMATE = 3         # 1920×1080 → ::3 整数抽样 → 640×360
-FOV_X_DEG = 65.0
-FOV_Y_DEG = 40.0
-# ⭐ 铁律:增益必须时间常数型 step = err × (1 − exp(−dt/TAU)),与帧率解耦。
-#   按"每帧吃固定比例"在高帧率下等效角速度爆表 + 相机 ~100ms 延迟 → 限位间打摆。
-TRACK_TAU = 0.40       # 收敛时间常数(s)
-TRACK_DEADBAND = 2.0   # 误差死区(度),防微抖
-TRACK_MAX_STEP = 1.5   # 单帧最大步进(度)
-TRACK_YAW_LIMIT = 25.0
-TRACK_PITCH_LIMIT = 15.0
-LOST_HOLD_S = 1.5      # 丢脸后保持朝向时长,超时缓慢回中
-RETURN_TAU = 0.8       # 回中时间常数(s)(同样与帧率解耦)
-YAW_SIGN = -1.0        # 画面右(u>0.5)= 机器人右边 → yaw 负(摄像头不镜像)
-PITCH_SIGN = +1.0      # 画面下 → pitch 正(低头)
-# 手势合成安全箱:手势 offset 叠加跟随基准后,yaw 裁剪到身体±箱,pitch 绝对裁剪
-GES_YAW_BOX = 25.0   # 相对身体
-GES_PITCH_BOX = 16.0
-
-# ── 声源转向(FUSION-02;DOA 要点与参考系教训见 CALIBRATION §11)──
-DOA_URL = "http://127.0.0.1:8000/api/state/doa"
-DOA_POLL_HZ = 10.0
-SND_WIN_S = 1.5            # DOA 中值窗口(VAD 触发率实测仅 11~57%,窗口要够长)
-SND_MIN_SAMPLES = 5        # 窗口最少有声样本(压反射双峰)
-SND_RESID_MIN = 25.0       # 残差超过此值才算"视场外声源"(触发门槛)
-SND_DONE_RESID = 10.0      # 链式跳间:残差小于此值=已对准声源,不再转
-DOA_DEBUG = os.environ.get("DOA_DEBUG") == "1"  # 诊断:打印每次 DOA raw/resid/IQR/confident/speaking
-# M1.5-a.5:长窗稳健 DOA + 可信度(老 SND_* 窗不动,这是另开的一条)
-DOA_WIN_S = 2.0            # 长观测窗(压随机离群,比 SND_WIN_S 长)
-DOA_MIN_SAMPLES = 6        # 长窗最少样本才出稳定方向
-GATE_SPREAD = 25.0         # 可信阈:长窗 IQR < 此值 = 稳(可用区 3-15° 判 True;镜像翻转 ~90° 判 False)
-# M1.5-a 方向门控:engaged 只收头朝向 ±GATE_DEG 内语音;只挡"确信范围外",其余放行
-GATE_DEG = 55.0            # 门控半角(±55°=110°宽);可调
-DOA_GATE_FRESH_S = 1.5     # 门控用 doa_at 的新鲜窗
-# M1.5-b 二次唤醒切换
-SWITCH_COOLDOWN_S = 2.0    # 切换冷却:刚切过去这么久内不响应新唤醒(防来回抽搐)
-SWITCH_AWAY_DEG = 35.0     # 切换转身:头离开A方向超过此角才放开认脸(途中无视任何脸,防被A拽回)
-SWITCH_SETTLE = 8.0        # 到目标角的判定容差
-SWITCH_TIMEOUT_S = 8.0     # 切换总超时(转+扫都没锁到B)→ 切换失败,回A(含直转+附近扫)
-SWITCH_COARSE_DEG = 70.0   # 三档切换:tier2/3 粗方向转离A的角度(足够远离A、在物理范围内)
-SND_FACE_FRESH_S = 1.2     # 最近见脸 < 此值 → 视觉在跟,DOA 不抢
-SND_MAX_HOPS = 3           # 一次事件最多链式转几跳(后方镜像角逐跳收缩,可达背后)
-SND_WAIT_FACE_S = 2.0      # 每跳后等人脸进视野的时长
-SND_COOLDOWN_S = 6.0       # 事件失败后的冷却(防无限转)
-SND_SPEED_DPS = 90.0       # 转向角速度(度/秒)
-SND_TARGET_LIMIT = 110.0   # 世界系目标限幅(身体 ±90 + 颈 ±23 以内)
-BODY_LIMIT_DEG = 90.0      # 身体转动限幅
-NECK_REL_LIMIT = 23.0      # 颈(Stewart)相对身体限幅(25° 留 2° 余量)
-
-# ── 行为状态机(FUSION-03;behavior_loop 统一调度,其余线程降级为传感器+执行器)──
-ST_ARMED = "ARMED"         # WAKE-01 待命:只听唤醒词"小艺",不连 Qwen,慢呼吸;命中才进 engaged
-ST_IDLE = "IDLE_CENTER"    # 中立待命:头回正 + 微动,监听声音/人脸
-ST_ENGAGING = "ENGAGING"   # 转向声源 + 主动扫头找人
-ST_TRACKING = "TRACKING"   # 视觉稳定跟随 + 对话/动作/微动
-ST_SEARCHING = "SEARCHING"  # 短暂找回:原地等,有声音则 DOA 辅助
-ST_RETURNING = "RETURNING"  # 平滑回中位
-FACE_FRESH_S = 0.4         # 人脸"新鲜"判定(瞬时)
-LOCK_ON_S = 0.3            # 迟滞:持续命中多久才算"锁定"(防单帧误触发进 TRACKING)
-LOCK_OFF_S = 1.5           # 迟滞:持续丢失多久才算"丢锁"(= LOST_HOLD,防瞬断退出 TRACKING)
-ENGAGE_TIMEOUT_S = 6.0     # ENGAGING 总超时(转向+扫描都没找到 → 放弃)
-ENGAGE_SCAN_RANGE = 15.0   # 转到声源后,主动扫头找人的幅度(度)
-ENGAGE_SCAN_TIME_S = 3.0   # 扫头找人时长
-SEARCH_TIMEOUT_S = 4.0     # SEARCHING 超时 → 回中位
-NO_INTERACT_S = 15.0       # engaged 无说话互动多久 → 回 armed 待命(WAKE-01 起从"回中"改"回待命")
-FSM_HZ = 25.0              # behavior_loop 频率
-
-# ── WAKE-01 唤醒词(详见 CALIBRATION §14;standalone 标定见 tools/wake01_kws_standalone.py)──
-KWS_MODEL_DIR = os.path.join(_REPO, "tools", "_kws_models",
-                             "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01")
-KWS_KEYWORDS = os.path.join(_REPO, "tools", "_kws_models", "keywords_d01.txt")  # 运行时生成(gitignore)
-KWS_FORMS = ["x iǎo y ī", "x iǎo y ìn", "x iǎo y ì"]   # 单字"小艺"三声调形态(真人落点实测)
-KWS_SINGLE_THR = 0.17      # 锁定值:召回~9/10,误触地板~0.7/5min(电视同音,留给 M1.5 DOA 门控)
-KWS_DEBOUNCE_S = 0.3       # 同一声"小艺"点亮多形态行算一次
-KWS_REFRACTORY_S = 2.0     # 唤醒后吞余波,防同次重复
-CONNECT_TIMEOUT_S = 3.0    # (b)命中才连:connect+session.updated 超时(实测~400ms),超时→失败反馈回 armed
-# armed 慢呼吸(用户定:活着但在休息,比 engaged 微动更轻更慢)
-ARMED_BREATH_F = 0.18      # Hz(周期~5.5s)
-ARMED_BREATH_PITCH = 2.5   # 度(小幅低头起伏)
-# 唤醒确认动作(M1c-a):heard=听到(上扬)、fail=连失败(下垂);一上一下一眼区分。CLI 可调 --cue-*
-# 叠加偏置(不抢渲染、可被转向打断);单槽后到覆盖先到。pitch+ =低头,故"抬头"取负。天线 +=上扬 -=下垂。
-CUE = {
-    "heard_dur": 0.45, "heard_pitch": 7.0, "heard_ant": 0.5,   # 上扬 "嗯?在。"
-    "fail_dur": 0.80,  "fail_pitch": 6.0,  "fail_ant": 0.7,    # 下垂 "没连上。"
-    "giveup_dur": 0.40, "giveup_pitch": 3.5, "giveup_ant": 0.35,  # 轻微下沉 "咦?没人。"(比 fail 更轻)
-    "bye_dur": 0.45,   "bye_pitch": 3.5,   "bye_ant": 0.45,    # 收束告别(EXIT-01;与 heard 上扬首尾呼应)
-    "barge_dur": 0.25, "barge_pitch": 2.0, "barge_ant": 0.3,   # 打断微反应(M3-b:微微后仰+天线收缩)
+# ── transcript 泄漏标签 → 物理动作兜底 ──
+_TAG_TO_ACTION = {
+    "nod": "nod", "点头": "nod", "nodding": "nod",
+    "shake": "shake_head", "shake_head": "shake_head", "摇头": "shake_head",
+    "wiggle": "wiggle_antennas", "摆天线": "wiggle_antennas", "wave": "wiggle_antennas",
+    "tilt": "tilt_head", "歪头": "tilt_head", "tilt_head": "tilt_head",
+    "smile": "wiggle_antennas", "微笑": "wiggle_antennas",
+    "look_left": "look_left", "look_right": "look_right",
+    "look_up": "look_up", "look_down": "look_down",
 }
-# 命中转向(M1c-b,策略 A;阈值依据见 CALIBRATION §14 DOA 实测)
-SPREAD_BAD = 40.0          # DOA 窗 IQR ≥ 此值 = 深后翻转不稳 → 坏区走宽扫(实测:可用≤15° / 深后~90°)
-WIDE_SCAN_RANGE = 88.0     # 宽扫可达弧(±度;受物理 ±90° 限,真正后 >90° 够不着)
-WIDE_SCAN_HZ = 0.18        # 宽扫正弦频率(慢,配合人脸检测帧率,别扫太快漏脸)
-WIDE_SCAN_TIME_S = 7.0     # SEEK 宽扫多久没脸 → 放弃回 armed
-DOA_WAKE_FRESH_S = 1.5     # SEEK 起扫方向取 DOA 的新鲜窗(只用符号当弱提示)
-# SEEK 的 pitch 覆盖(解决"人比摄像头高、水平扫漏脸";pitch+ 为低头,故抬头取负)
-SEEK_PITCH_UP = -6.0       # 抬头偏置(度)
-SEEK_PITCH_AMP = 6.0       # pitch 慢摆幅度(覆盖 约 0~-12° 高度范围)
-SEEK_PITCH_HZ = 0.30       # pitch 摆动频率(慢,配合人脸检测)
-# SEEK 两阶段(confident 直转→附近找脸→全场扫兜底)
-SEEK_NEARBY_DEG = 25.0     # 阶段二:到位后附近扫范围(±度)
-SEEK_NEARBY_TIME_S = 2.5   # 阶段二:附近扫多久没脸 → 退化全场扫
-SEEK_SUPPRESS_DEG = 12.0   # 阶段一:压锁豁免——|resid|<此值视为"正前",不压锁直接秒锁
-# 唤醒应答(WAKE-01 后续①):SEEK 锁脸那刻,让模型说一句简短招呼(模型生成,天然轮换;克制)
-GREET_PHRASES = ["在呢", "来啦", "你好呀", "我在", "嗨,你好", "诶,在的", "怎么啦"]  # 轮换,避免每次同一句
-def greet_prompt(phrase: str) -> str:
-    return (f"用户刚出现在你面前(你刚找到他)。用中文口语自然地说一句简短招呼,"
-            f"就说「{phrase}」的意思(可带个语气词,保持很短);**别用英文、别解释、别提'找到你了'**。")
-
-# 退出指令(EXIT-01):告别语代码轮换(沿用①教训,变异靠代码不靠 prompt);短语嵌进 function_call_output
-BYE_PHRASES = ["好的", "拜拜", "休息啦", "我先歇会儿", "回头见", "去忙啦", "嗯,先这样"]
-EXIT_MIN_S = 1.5           # 退出:回 armed 前至少等这么久(让告别语播出来)
-EXIT_MAX_S = 6.0           # 退出:封顶,告别再长/卡住也强制回 armed(不挂死)
-
-# ── 指向转头(POINT-02-b):手指 2D 方向 → 头部转角 ──
-ST_POINTING = "POINTING"   # 指向转头中(转完 → snapshot → 回 TRACKING)
-POINT_FRESH_S = 1.2        # 食指方向"新鲜"判定(behavior 读最近一次手部检测)
-POINT_YAW_GAIN = 38.0      # 水平指向 → yaw 转角(度;转头不求精确,把目标转进画面即可)
-POINT_PITCH_GAIN = 12.0    # 垂直指向 → pitch 转角(度)
-POINT_TURN_TIMEOUT_S = 2.5  # 转头封顶时长
-POINT_SETTLE_S = 0.6       # 转到位后停稳多久再抓帧(让电机+相机稳定,目标居中)
-POINT_HOLD_MAX_S = 4.0     # 抓帧后最多保持朝向多久(等看图描述返回,期间不被拽回人脸)
-
-# ── 手部互动"逗它"(PLAY-01-b):近处大手吸引注意力 → PLAYING 跟手 + 开心表达 ──
-# 跟手参数全部来自 standalone 六轮实测调校(vision/play01_hand_track.py)
-ST_PLAYING = "PLAYING"     # 逗它中:头跟手 + 天线开心摆(手势/指向优先级更高)
-PLAY_SIZE_ON = 0.30        # 手 bbox 最大边占画面比 ≥ 此值(够近)才可进入
-PLAY_SIZE_OFF = 0.22       # 跟踪/保持下限(迟滞;更小的"手"= 背景误检,源头过滤)
-PLAY_SCORE_MIN = 0.6       # handedness score 当置信度(真手>0.9,背景误检<0.6)
-PLAY_HAND_V_MAX = 0.80     # 手中心 v ≤ 此值才接受:v>0.80 是画面底部(桌面/衣物误检区)
-PLAY_ON_S = 0.3            # 持续够大才进入(防路过挥手误触)
-PLAY_OFF_S = 1.5           # 近手消失持续此值才退出(手怼太近检测会连丢 1s+)
-PLAY_FRESH_S = 0.4         # 手读数"新鲜"判定
-# "晃"才是逗(用户 spec 原文"近处中心晃=逗它";实测教训:托下巴的静止手会误触发→抬头盯手)
-PLAY_MOVE_WIN_S = 0.8      # 手部运动量统计窗口
-PLAY_MOVE_MIN = 0.08       # 窗口内位移(画面占比)≥ 此值才算"在晃"(托下巴抖动 <0.03)
-PLAY_STILL_S = 4.0         # 逗它中手静止超过此值 → 没意思了,回跟脸(猫不盯不动的逗猫棒)
-PLAY_TAU = 0.25            # 跟手收敛常数(比跟脸 0.40 灵敏,逗它要跟得上)
-PLAY_MAX_STEP = 3.0        # 单帧步进上限(≈90°/s,与听声转头同速)
-PLAY_AMP = 0.90            # 幅度系数(用户验收:幅度收 10% 手感最佳)
-PLAY_YAW_LIMIT = TRACK_YAW_LIMIT * PLAY_AMP     # 相对身体 ±22.5°
-PLAY_PITCH_LIMIT = TRACK_PITCH_LIMIT * PLAY_AMP
-PLAY_COAST_S = 0.35        # 快手丢检测时惯性外推时长(像猫预判逗猫棒)
-PLAY_COAST_DU = 0.20       # 外推位移封顶(画面占比;不封顶会甩到画面边)
-PLAY_COAST_VEL = 2.0       # 外推速度钳位(/s;防检出跳变的速度尖峰)
-PLAY_JOY_DELAY_S = 5.0     # 持续逗它这么久后才第一次摇天线(用户反馈:一进就摇很怪)
-PLAY_JOY_PERIOD_S = 7.0    # 之后每隔此值小摇一次(有节奏不神经质)
-PLAY_JOY_FLICK_S = 0.6     # 小天线摆时长
-PLAY_REENTRY_S = 3.0       # 退出后这么久内再进入算"继续逗",不重置节拍(防进出抖动)
-
-# ── M3-a 运动基础:缓动曲线 + 全态呼吸 + 微变异 ──
-EASE_ATTACK_FRAC = 0.35    # cue 攻击阶段占比(easeOutBack 快速上冲带过冲)
-BREATH_PARAMS = {           # 全态呼吸 (freq_hz, pitch_amp_deg);τ=2s 平滑切换
-    "ARMED":       (0.18, 2.5),
-    "IDLE_CENTER": (0.22, 1.8),
-    "TRACKING":    (0.25, 1.0),
-    "SEARCHING":   (0.25, 1.0),
-    "ENGAGING":    (0.20, 0.5),
-    "RETURNING":   (0.22, 1.5),
-    "POINTING":    (0.20, 0.5),
-    "PLAYING":     (0.30, 0.8),
-}
-BREATH_BLEND_TAU = 2.0     # 呼吸参数切换平滑常数(s)
-CUE_VARIATION = 0.15       # cue 微变异幅度(±15%)
-
-# ── M3-b 事件反应:打断微反应 + 思考微行为 + 表情回应 ──
-THINK_ROLL_AMP = 3.0       # 思考歪头幅度(度)
-THINK_ROLL_F = 0.15        # Hz
-THINK_PITCH = -1.5         # 思考时微微抬头(度)
-THINK_ANT_AMP = 0.15       # 天线不对称摆动幅度(rad)
-THINK_ANT_F = 0.25         # Hz
-THINK_BLEND_TAU = 0.5      # 思考行为淡入淡出(s)
-EXPR_SMILE_ANT = 0.20      # 用户微笑 → 天线上扬(rad)
-EXPR_FROWN_ANT = -0.15     # 用户皱眉 → 天线下垂(rad)
-EXPR_BLEND_TAU = 0.8       # 表情响应平滑常数(s)
-
-# ── M3-c 记忆 ──
-_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-PROFILE_PATH = os.path.join(_DATA_DIR, "profile.json")
-MEMORY_PATH = os.path.join(_DATA_DIR, "memory.v1.json")
-SUMMARY_MODEL = "qwen-turbo"
-
-
-def log(msg: str) -> None:
-    global _vis_log_seq
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
-    _vis_log_seq += 1
-    _vis_log_buf.append((_vis_log_seq, line))
-
-
-# ───────────── 对话事件录制（Conversation Dashboard 数据源）─────────────
-def _event_label(etype: str, event: dict) -> str:
-    """为 Realtime API 事件生成人类可读的一行摘要。"""
-    if etype == "session.created":
-        return "🔗 会话建立"
-    if etype == "session.updated":
-        return "⚙️ 会话配置生效"
-    if etype == "input_audio_buffer.speech_started":
-        return "🎤 用户开始说话"
-    if etype == "input_audio_buffer.speech_stopped":
-        return "🤫 用户说完"
-    if etype == "conversation.item.input_audio_transcription.completed":
-        t = (event.get("transcript") or "").strip()[:80]
-        return f'📝 ASR: 「{t}」'
-    if etype == "response.created":
-        return "💭 模型开始生成"
-    if etype == "response.function_call_arguments.done":
-        return f'🤖 工具调用: {event.get("name", "?")}'
-    if etype == "response.audio_transcript.done":
-        t = (event.get("transcript") or "").strip()[:80]
-        return f'🔊 模型输出: 「{t}」'
-    if etype == "response.done":
-        return "✅ 回复完成"
-    if etype == "response.audio_transcript.delta":
-        return None  # 高频 delta 不录制
-    if etype == "response.audio.delta":
-        return None  # 音频 delta 不录制
-    return etype
-
-
-def _record_event(etype: str, event: dict) -> None:
-    """录制一条 Realtime API 事件到 _conv_events，并维护高层轮次。不影响任何现有逻辑。"""
-    global _conv_seq, _current_turn, _turn_counter, _pending_asr
-    label = _event_label(etype, event)
-    if label is None:
-        return  # 跳过高频 delta 事件
-
-    _conv_seq += 1
-    seq = _conv_seq
-    now_wall = time.time()
-    now_mono = time.monotonic()
-    ts = time.strftime("%H:%M:%S", time.localtime(now_wall)) + f".{int(now_wall * 1000) % 1000:03d}"
-
-    # role 分类
-    prefix = etype.split(".")[0]
-    role = {"input_audio_buffer": "user", "conversation": "user",
-            "response": "model", "session": "system"}.get(prefix, "system")
-
-    # payload: 裁剪大字段
-    payload = {k: v for k, v in event.items()
-               if k not in ("audio", "delta") and not (isinstance(v, str) and len(v) > 2000)}
-
-    entry = {"seq": seq, "ts": ts, "ts_mono": now_mono,
-             "type": etype, "role": role, "label": label, "payload": payload}
-    _conv_events.append(entry)
-
-    # 维护高层轮次
-    if etype == "conversation.item.input_audio_transcription.completed":
-        asr_text = (event.get("transcript") or "").strip()
-        if _current_turn is not None:
-            # turn already open (rare: ASR very late)
-            _current_turn["asr"] = asr_text
-        else:
-            # normal case: ASR arrives before response.created — buffer it
-            _pending_asr = asr_text
-    if etype == "response.created":
-        # 如果上一轮因服务端错误/断连未正常关闭，先强制结束它
-        if _current_turn is not None:
-            _current_turn["end_ts"] = ts
-            _current_turn["end_mono"] = now_mono
-        # 收集最近 10s 内的 vis/doa/gate 事件作为"触发上下文"
-        ctx_cutoff = now_mono - 10.0
-        ctx = [e["label"] for e in _conv_events
-               if e["ts_mono"] > ctx_cutoff and e["role"] == "system"
-               and e["type"] not in ("session.created", "session.updated")]
-        _turn_counter += 1
-        turn = {"turn_id": seq, "turn_num": _turn_counter,
-                "start_ts": ts, "start_mono": now_mono,
-                "end_ts": None, "end_mono": None,
-                "asr": _pending_asr, "tool_calls": [], "transcript": "",
-                "snapshot_desc": "", "events": [seq],
-                "context": ctx[-5:]}  # 最多5条前置上下文
-        _pending_asr = ""  # consumed
-        _current_turn = turn
-        if len(_conv_turns) >= 100:
-            _conv_turns.pop(0)
-        _conv_turns.append(turn)
-    elif _current_turn is not None:
-        _current_turn["events"].append(seq)
-        if etype == "response.function_call_arguments.done":
-            _current_turn["tool_calls"].append({
-                "name": event.get("name", ""),
-                "call_id": event.get("call_id", ""),
-                "output_preview": "",
-            })
-        elif etype == "response.audio_transcript.done":
-            _current_turn["transcript"] = (event.get("transcript") or "").strip()
-        elif etype == "response.done":
-            _current_turn["end_ts"] = ts
-            _current_turn["end_mono"] = now_mono
-            _current_turn = None
-
-
-def _record_snap_result(call_id: str, mode: str, desc: str, ok: bool) -> None:
-    """把 snapshot_loop 的 VLM 结果写入当前轮次，并追加一条事件。"""
-    global _conv_seq
-    _conv_seq += 1
-    now_wall = time.time()
-    now_mono = time.monotonic()
-    ts = time.strftime("%H:%M:%S", time.localtime(now_wall)) + f".{int(now_wall * 1000) % 1000:03d}"
-    preview = desc[:120] + ("…" if len(desc) > 120 else "")
-    entry = {"seq": _conv_seq, "ts": ts, "ts_mono": now_mono,
-             "type": "vlm.result", "role": "tool",
-             "label": f'🖼️ VLM[{mode}]: 「{preview}」',
-             "payload": {"call_id": call_id, "mode": mode, "ok": ok, "desc": desc}}
-    _conv_events.append(entry)
-    # 写入当前轮次或最近轮次（snapshot 可能在 response.done 后才回来）
-    turn = _current_turn or (_conv_turns[-1] if _conv_turns else None)
-    if turn is not None:
-        turn["snapshot_desc"] = desc
-        turn["events"].append(_conv_seq)
-        # 把 output_preview 填回对应 tool_call
-        for tc in turn["tool_calls"]:
-            if tc["call_id"] == call_id:
-                tc["output_preview"] = preview
-                break
-
-
-def _record_vis_event(etype: str, label: str, payload: "dict | None" = None) -> None:
-    """录制非 Realtime API 事件（状态机、视觉、DOA、门控等）到 _conv_events。
-    etype 前缀约定：vis.*=视觉/行为, gate.*=门控, doa.*=声源, audio.*=音频输入。"""
-    global _conv_seq
-    _conv_seq += 1
-    now_wall = time.time()
-    now_mono = time.monotonic()
-    ts = time.strftime("%H:%M:%S", time.localtime(now_wall)) + f".{int(now_wall * 1000) % 1000:03d}"
-    entry = {"seq": _conv_seq, "ts": ts, "ts_mono": now_mono,
-             "type": etype, "role": "system",
-             "label": label, "payload": payload or {}}
-    _conv_events.append(entry)
-    # 把行为事件也关联到当前轮次
-    if _current_turn is not None:
-        _current_turn["events"].append(_conv_seq)
-
-
-# ───────────────────────── 动作库(CALIBRATION.md §2 标定参数)─────────────────────────
-INIT_HEAD_POSE = np.eye(4)
-INIT_ANTENNAS = [-0.1745, 0.1745]
-
-
-def head_pose(pitch_deg: float = 0.0, yaw_deg: float = 0.0, roll_deg: float = 0.0) -> np.ndarray:
-    T = np.eye(4)
-    T[:3, :3] = R.from_euler("xyz", [roll_deg, pitch_deg, yaw_deg], degrees=True).as_matrix()
-    return T
-
-
-def gpose(yaw: float, pitch: float, body: float, roll: float = 0.0) -> np.ndarray:
-    """手势姿态 = 跟随基准 + 手势 offset;yaw 裁剪到身体±箱(颈不顶限),pitch 绝对裁剪。"""
-    return head_pose(
-        pitch_deg=float(np.clip(pitch, -GES_PITCH_BOX, GES_PITCH_BOX)),
-        yaw_deg=float(np.clip(yaw, body - GES_YAW_BOX, body + GES_YAW_BOX)),
-        roll_deg=roll,
-    )
-
-
-# 所有手势签名 (mini, base_yaw, base_pitch, body):以当前跟随姿态为基准做、做完回基准;
-# ⭐ body_yaw 必须传当前身体朝向(传 0 会把转过去的身体拽回正前)
-def act_nod(m: ReachyMini, by: float, bp: float, body: float) -> None:
-    brad = math.radians(body)
-    for _ in range(2):
-        m.goto_target(gpose(by, bp + 15, body), duration=0.35, body_yaw=brad)
-        m.goto_target(gpose(by, bp - 10, body), duration=0.35, body_yaw=brad)
-    m.goto_target(gpose(by, bp, body), duration=0.35, body_yaw=brad)
-
-
-def act_shake(m: ReachyMini, by: float, bp: float, body: float) -> None:
-    brad = math.radians(body)
-    for _ in range(2):
-        m.goto_target(gpose(by + 15, bp, body), duration=0.35, body_yaw=brad)
-        m.goto_target(gpose(by - 15, bp, body), duration=0.35, body_yaw=brad)
-    m.goto_target(gpose(by, bp, body), duration=0.35, body_yaw=brad)
-
-
-def _look(m: ReachyMini, by: float, bp: float, body: float,
-          yaw_off: float = 0.0, pitch_off: float = 0.0) -> None:
-    """看向某方向(相对身体正前的偏向),看完回跟随基准。"""
-    brad = math.radians(body)
-    m.goto_target(gpose(body + yaw_off, pitch_off, body), duration=0.6, body_yaw=brad)
-    time.sleep(0.8)
-    m.goto_target(gpose(by, bp, body), duration=0.6, body_yaw=brad)
-
-
-def act_wiggle(m: ReachyMini, by: float, bp: float, body: float) -> None:
-    brad = math.radians(body)
-    for _ in range(2):
-        m.goto_target(antennas=[+0.8, -0.8], duration=0.3, body_yaw=brad)
-        m.goto_target(antennas=[-0.8, +0.8], duration=0.3, body_yaw=brad)
-    m.goto_target(antennas=INIT_ANTENNAS, duration=0.35, body_yaw=brad)
-
-
-def act_tilt(m: ReachyMini, by: float, bp: float, body: float) -> None:
-    brad = math.radians(body)
-    m.goto_target(gpose(by, bp, body, roll=15), duration=0.5, body_yaw=brad)
-    time.sleep(0.8)
-    m.goto_target(gpose(by, bp, body), duration=0.5, body_yaw=brad)
-
-
-ACTIONS = {
-    "nod": act_nod,
-    "shake_head": act_shake,
-    "look_left": lambda m, by, bp, body: _look(m, by, bp, body, yaw_off=+16),
-    "look_right": lambda m, by, bp, body: _look(m, by, bp, body, yaw_off=-16),
-    "look_up": lambda m, by, bp, body: _look(m, by, bp, body, pitch_off=-16),
-    "look_down": lambda m, by, bp, body: _look(m, by, bp, body, pitch_off=+16),
-    "wiggle_antennas": act_wiggle,
-    "tilt_head": act_tilt,
-}
-
-_NOPARAM = {"type": "object", "properties": {}}
-TOOLS = [
-    {"type": "function", "name": "nod", "description": "点头。打招呼、同意、确认、答应请求时使用。", "parameters": _NOPARAM},
-    {"type": "function", "name": "shake_head", "description": "摇头。否定、拒绝、不同意、说'不'时使用。", "parameters": _NOPARAM},
-    {"type": "function", "name": "look_left", "description": "把头转向左边看。", "parameters": _NOPARAM},
-    {"type": "function", "name": "look_right", "description": "把头转向右边看。", "parameters": _NOPARAM},
-    {"type": "function", "name": "look_up", "description": "抬头看上方。", "parameters": _NOPARAM},
-    {"type": "function", "name": "look_down", "description": "低头看下方。", "parameters": _NOPARAM},
-    {"type": "function", "name": "wiggle_antennas", "description": "欢快地摆动头顶天线。表达开心、兴奋、被夸奖、热情时使用。", "parameters": _NOPARAM},
-    {"type": "function", "name": "tilt_head", "description": "歪头。表达好奇、疑惑、思考、没听懂时使用。", "parameters": _NOPARAM},
-    {"type": "function", "name": "end_session",
-     "description": "结束本次对话、让机器人回到待命休息。仅当用户【明确表达要结束对话/让你退下/离开】时才调用,"
-                    "例如「走吧」「退下」「你先忙」「没事了」「拜拜」「不聊了」「先这样」「就到这」。"
-                    "⚠️ 注意:「再说吧」「这个先放一边」「等会儿」「待会聊」「先放着」「回头说」等只是话题搁置或语气词,"
-                    "【不是】结束对话,绝不要因此调用;拿不准时继续对话、不要调。",
-     "parameters": _NOPARAM},
-    {"type": "function", "name": "take_snapshot",
-     "description": "用摄像头拍一张当前画面并理解内容。当用户让你看东西、问'你看到什么''我手里是什么'等需要视觉、但不涉及'指向'的问题时调用。",
-     "parameters": _NOPARAM},
-    {"type": "function", "name": "identify_pointed_object",
-     "description": "当用户用手指指向画面中某个物体、问'这是什么''我指的是什么''这个是啥'等需要判断他指向哪个物体时调用。会拍照并理解用户手指指向的目标。",
-     "parameters": _NOPARAM},
-] + QWEN_TOOLS
-
-# 看图 prompt(POINT-01)。两个都做"指向感知":工具路由从音频判断"是否指向"不可靠
-# (实测模型对"你看这是什么"会选通用看图),故通用 prompt 也兜底处理指向。
-_POINT_GUIDE = ("如果用户正在用手指指向画面中某个物体(看手的朝向、伸出的食指延长线),"
-                "请重点判断并明确说出他指的是哪一个物体、那是什么;")
-SNAP_PROMPTS = {
-    "scene": ("你是机器人的眼睛。用简体中文两三句话回答。" + _POINT_GUIDE +
-              "否则描述画面主要内容,特别是人手里举着或拿着的物体(若有)。"),
-    "point": ("你是机器人的眼睛。用户正在用手指指向画面中的某个物体。"
-              "请仔细观察用户手指的指向(手的朝向、伸出的食指延长线),"
-              "判断用户指的是哪一个物体,用简体中文两三句话明确说出那个物体是什么并简要描述。"
-              "如果画面里没有看到明显的指向手势,就说你不太确定他指的是哪个,并描述画面里最可能的几个物体。"),
-    # 两段式指向(用户定的根治方案):先原地看图,让 VLM 判断"是否真在指/目标是否已在画面",
-    # 确认在指且目标不在画面才转头。本地关键点只做廉价提示,不再决定是否转头/往哪转
-    # (实测食指延长线 2D 角度噪声大,会算出莫名的"上"分量 → 错误抬头)。
-    "judge": ("你是机器人的眼睛。用户刚问了类似'这是什么'的问题。"
-              "请只输出一个 JSON 对象,不要输出任何其他文字、不要代码块标记:\n"
-              '{"pointing": true或false, "target_visible": true或false, '
-              '"direction": "左|右|上|下|左上|左下|右上|右下|无", "desc": "..."}\n'
-              "字段含义:pointing=画面中用户是否正在用手指明确指向某个东西;"
-              "target_visible=他所指的目标物体是否完整清晰地出现在画面里(目标在画面外、"
-              "在边缘被切掉、或顺着手指方向看不到具体目标都算 false);"
-              "direction=顺着手指延长线,目标相对画面中心在哪个方向(画面坐标;没在指就填'无');"
-              "desc=用简体中文两三句话:若 pointing 为 true 且 target_visible 为 true,"
-              "明确说出他指的物体是什么并简述;若 pointing 为 false,正常描述画面主要内容"
-              "(特别是人手里拿着的物体);若目标不在画面里,desc 留空字符串。"),
-}
-
-# VLM 粗方向 → 头部转角(画面坐标:右 → yaw 负,下 → pitch 正,同关键点映射约定)
-_DIR_MAP = {
-    "左": (+30.0, 0.0), "右": (-30.0, 0.0),
-    "上": (0.0, -10.0), "下": (0.0, +10.0),
-    "左上": (+22.0, -8.0), "右上": (-22.0, -8.0),
-    "左下": (+22.0, +8.0), "右下": (-22.0, +8.0),
-}
-
-
-def parse_judge(raw: str) -> dict | None:
-    """宽容解析 VLM 的 judge JSON(剥代码块/取首尾大括号);失败返回 None。"""
-    s = raw.strip()
-    if "```" in s:
-        s = s.replace("```json", "```").split("```")[1] if s.count("```") >= 2 else s
-    i, j = s.find("{"), s.rfind("}")
-    if i < 0 or j <= i:
-        return None
-    try:
-        d = json.loads(s[i:j + 1])
-        return d if isinstance(d, dict) else None
-    except Exception:
-        return None
+_ACTION_TAG_RE = re.compile(
+    r"</?(?:" + "|".join(re.escape(k) for k in _TAG_TO_ACTION) + r")[^>]*>"
+    r"|[（(](?:" + "|".join(re.escape(k) for k in _TAG_TO_ACTION) + r")[)）]"
+    r"|\*(?:" + "|".join(re.escape(k) for k in _TAG_TO_ACTION) + r")\*",
+    re.IGNORECASE,
+)
+def _extract_tag_action(match_str: str) -> str | None:
+    s = match_str.strip("<>/()（）* \t").lower()
+    return _TAG_TO_ACTION.get(s)
 
 
 # ───────────────────────── M3-c 记忆:读写 + 退出摘要 ─────────────────────────
@@ -737,129 +284,6 @@ def summarize_conversation(oai_client, conversation_log: list) -> dict | None:
     except Exception as e:
         log(f"⚠ 对话摘要失败:{e}")
     return None
-
-
-# ───────────────────────── One Euro 滤波(VIS-01 验证参数)─────────────────────────
-class OneEuroFilter:
-    """标准 One Euro:低速强平滑防抖,高速低延迟跟手。丢脸后必须 reset。"""
-
-    def __init__(self, min_cutoff: float = 0.8, beta: float = 0.08, d_cutoff: float = 1.0):
-        self.min_cutoff = min_cutoff
-        self.beta = beta
-        self.d_cutoff = d_cutoff
-        self.x_prev: float | None = None
-        self.dx_prev = 0.0
-        self.t_prev: float | None = None
-
-    @staticmethod
-    def _alpha(cutoff: float, dt: float) -> float:
-        tau = 1.0 / (2.0 * math.pi * cutoff)
-        return 1.0 / (1.0 + tau / dt)
-
-    def __call__(self, x: float, t: float) -> float:
-        if self.x_prev is None:
-            self.x_prev, self.t_prev = x, t
-            return x
-        dt = max(1e-3, t - self.t_prev)
-        self.t_prev = t
-        dx = (x - self.x_prev) / dt
-        a_d = self._alpha(self.d_cutoff, dt)
-        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
-        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
-        a = self._alpha(cutoff, dt)
-        x_hat = a * x + (1 - a) * self.x_prev
-        self.x_prev, self.dx_prev = x_hat, dx_hat
-        return x_hat
-
-    def reset(self) -> None:
-        self.x_prev = None
-        self.dx_prev = 0.0
-        self.t_prev = None
-
-
-# ───────────────────────── 共享状态 ─────────────────────────
-class State:
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.session_updated = threading.Event()
-        # 播放 / 打断
-        self.play_gen = 0
-        self.drop_audio = False
-        self.in_flight = 0
-        self.playback_end_estimate = 0.0
-        # function calling 协调(O-01a 修复2:即时回 output + 纯动作响应立即补话)
-        self.resp_audio_count = 0
-        self.fc_seen_this_resp = False
-        self.fc_gen = 0
-        # 行为状态机(FUSION-03)
-        self.state = ST_IDLE           # 当前行为状态(behavior_loop 唯一写;main 见 ST_ARMED 转换管 WS)
-        self.wake_ok = False           # WAKE-01:main 连接成功后置一次性信号,behavior 读后清→离开 ARMED
-        self.wake_cue = None           # 唤醒确认动作:None/"heard"(上扬)/"fail"(下垂);main 写,head_control 读
-        self.wake_cue_t = 0.0          # 上述 cue 的起始时刻(head_control 据此算包络)
-        self.greet_now = False         # 唤醒应答:SEEK 锁脸那刻置(behavior 写),main 消费→让模型招呼一句
-        self.exit_request = False      # EXIT-01:end_session 工具置(ChatCallback 写 flag),behavior 读→回 armed(不破单写者)
-        self.switch_request = None     # M1.5-b:engaged 范围外二次唤醒,main 置 {resid,confident},behavior 读→转向新人 B
-        self.action_active = False     # Primary 手势执行中 → 头控让位给 goto
-        self.track_yaw = 0.0           # 头的【世界】朝向目标(TRACKING 由视觉积分,其余由 behavior 驱动)
-        self.track_pitch = 0.0
-        self.body_yaw_deg = 0.0        # 身体当前朝向(度)
-        self.face_seen_at = 0.0        # 最近一次检出人脸的时刻(瞬时)
-        self.face_locked = False       # 迟滞后的"稳定有脸"判定(behavior 用它做 TRACKING 进出)
-        self.last_interaction_at = 0.0  # 最近一次说话互动(用户/机器人)→ RETURNING 计时
-        self.sound_resid = None        # DOA 传感器:置信的视场外声源残差(度),无则 None
-        self.sound_at = 0.0            # 上述读数的时刻
-        self.sound_spread = 0.0        # DOA 窗内 raw 的 IQR(p75−p25):稳定性,坏区(深后翻转)判据
-        self.wake_doa = None           # 命中瞬间快照 {resid,spread,fresh}:M1c 转向分流用(main 写,behavior 读)
-        # M1.5-a.5:长窗稳健 DOA + 可信度(给 M1.5-b/方向门控用;老 sound_* 不动)
-        self.doa_resid_stable = None   # 长窗(DOA_WIN_S)中值残差(度);无则 None
-        self.doa_confident = False     # 可信度:长窗 IQR<GATE_SPREAD 且样本够(=稳,非=对)
-        self.doa_at = 0.0              # 上述长窗读数时刻(消费方判 fresh)
-        # 指向(POINT-02):视觉子进程发布的最近食指方向 + 待处理的指向请求
-        self.finger_angle = None       # 食指画面系角度(度),无则 None
-        self.finger_at = 0.0
-        self.finger_extended = False
-        self.finger_ext_at = 0.0       # 最后一次见到"伸出的食指"的时刻(粘滞:检测 ~6Hz 会闪烁)
-        # 逗它(PLAY-01):最近一次"近手"读数(已过 score+size 双门,小误检不入)
-        self.hand_u = 0.5
-        self.hand_v = 0.5
-        self.hand_size = 0.0
-        self.hand_at = 0.0
-        self.hand_move = 0.0           # 近手在 PLAY_MOVE_WIN_S 窗口内的位移(晃动量)
-        self.point_request = None      # {"call_id","gen"}:模型调了 identify_pointed_object,待转头看图
-        self.snap_grabbed = False      # snapshot_loop 抓到帧的握手(POINTING 等它为真才许转回)
-        # 帧共享(视觉线程是唯一持续 get_frame 者;take_snapshot 读这里)
-        self.latest_frame = None
-        self.latest_frame_t = 0.0
-        # take_snapshot:进行中的快照数(挂起时 response.done 不补话,等描述回来)
-        self.snapshot_pending = 0
-        # VIS_DEBUG 专用：视觉子进程实际看到的降采样帧 + 最新检测结果（VIS_DEBUG=1 时写入）
-        self.dbg_frame_small = None   # ndarray RGB H×W×3，与视觉子进程收到的帧相同
-        self.dbg_det = None           # dict {"face":(u,v,h)|None, "hand":{...}|None, "n_faces":int}
-        # VIS_DEBUG 专用：DOA 可视化字段（DEBUG-02，由 behavior_loop/main loop 写入）
-        self.dbg_gate_open = True     # 当前 M1.5-a 门控状态（True=放行，False=静音）
-        self.dbg_switching = False    # 当前是否在 M1.5-b 切换中
-        self.dbg_switch_phase = ""    # "turn" / "nearby" / "sweep" / ""
-        self.dbg_switch_target = 0.0  # 切换目标角（世界坐标，度）
-        # 手势状态（GESTURE-01，仅 onnx/mediapipe backend 填充）
-        self.gesture = None        # 最新手势 str 或 None
-        self.gesture_at = 0.0      # 上次检出有效手势的时刻
-        self.gesture_fingers = 0   # 最新手指数
-        # M3 运动/反应 flags(main 设置,运行时不变)
-        self.no_easing = False
-        self.no_breathe = False
-        self.no_variation = False
-        self.no_expression = False
-        self.no_memory = False
-        # M3-b 思考/表情
-        self.thinking = False          # 模型思考中(speech_stopped → first audio out)
-        self.user_smile = 0.0          # blendshape 微笑系数 0-1
-        self.user_frown = 0.0          # blendshape 皱眉系数 0-1
-        # M3-c 对话记录(退出时摘要用)
-        self.conversation_log = []     # [(role, text), ...]
-        # 身份识别(P0)
-        self.current_person_id: str | None = None
-        self.current_person_name: str | None = None
-        self.identity_injected = False
 
 
 # ───────────────────────── ①对话:回调,收服务端事件(打断/工具分发/计时器喂养)─────────────────────────
@@ -987,7 +411,7 @@ class ChatCallback(OmniRealtimeCallback):
                         st.snapshot_pending += 1
                     log("👉 收到指向请求 → 先原地看图判断(两段式)")
                     self.snap_q.put({"call_id": call_id, "gen": st.fc_gen, "mode": "judge"})
-                elif name in ("remember_fact", "clear_memory"):
+                elif name in ("remember_fact", "clear_memory", "forget_fact"):
                     with st.lock:
                         pid = st.current_person_id
                     if pid is None:
@@ -998,13 +422,34 @@ class ChatCallback(OmniRealtimeCallback):
                             args_dict = json.loads(args_str)
                         except (json.JSONDecodeError, TypeError):
                             args_dict = {}
-                        result = _memory_mgr.handle_tool_call(pid, name, args_dict)
-                        if name == "remember_fact" and args_dict.get("key") == "name":
-                            new_name = args_dict.get("value")
-                            if new_name and _id_recognizer is not None:
-                                _id_recognizer.db.set_name(pid, new_name)
+                        result = _memory_mgr.handle_tool_call(pid, name, args_dict,
+                                                                actor_pid=pid)
+                        if name == "remember_fact":
+                            with st.lock:
+                                st.identity_injected = False
+                            if args_dict.get("key") == "name":
+                                new_name = args_dict.get("value")
+                                if new_name and _id_recognizer is not None:
+                                    _id_recognizer.db.set_name(pid, new_name)
+                                    with st.lock:
+                                        st.current_person_name = new_name
+                                    if _owner_mgr is not None and not _owner_mgr.has_owner():
+                                        if _owner_mgr.try_claim(pid, new_name):
+                                            log(f"👑 认主成功: {new_name} ({pid})")
+                        elif name == "clear_memory":
+                            if _id_recognizer is not None:
+                                _id_recognizer.db.set_name(pid, None)
+                            with st.lock:
+                                st.current_person_name = None
+                                st.identity_injected = False
+                        elif name == "forget_fact":
+                            with st.lock:
+                                st.identity_injected = False
+                            if "name" in args_dict.get("key", "").lower():
+                                if _id_recognizer is not None:
+                                    _id_recognizer.db.set_name(pid, None)
                                 with st.lock:
-                                    st.current_person_name = new_name
+                                    st.current_person_name = None
                     try:
                         self.conv.create_item({
                             "type": "function_call_output", "call_id": call_id,
@@ -1029,6 +474,13 @@ class ChatCallback(OmniRealtimeCallback):
             elif etype == "response.audio_transcript.done":
                 print(flush=True)
                 _atext = (event.get("transcript") or "").strip()
+                if _atext:
+                    for m in _ACTION_TAG_RE.finditer(_atext):
+                        act = _extract_tag_action(m.group())
+                        if act:
+                            log(f"⚠ 标签泄漏兜底: '{m.group()}' → 触发 {act}")
+                            self.motion_q.put({"name": act})
+                    _atext = _ACTION_TAG_RE.sub("", _atext).strip()
                 if _atext and not st.no_memory:
                     with st.lock:
                         st.conversation_log.append(("assistant", _atext))
@@ -1266,8 +718,7 @@ def vision_result_loop(st: State, result_q, stop: threading.Event) -> None:
     hvel_u = hvel_v = 0.0
     hand_win: collections.deque = collections.deque()  # (t,u,v) 晃动量统计窗
     miss_streak = 0
-    hit_run_start = None       # 连续命中起点(锁定迟滞用)
-    miss_run_start = None      # 连续丢失起点(丢锁迟滞用)
+    hit_window: collections.deque = collections.deque(maxlen=LOCK_WIN)
     locked = False
     _id_last_t = 0.0           # 上次身份识别时刻(限频)
     n_det = 0
@@ -1282,6 +733,8 @@ def vision_result_loop(st: State, result_q, stop: threading.Event) -> None:
             continue
         if msg.get("kind") == "ready":
             log("👁 视觉子进程就绪(Face 跟随 + Hand 指向,独立 GIL)")
+            with st.lock:
+                st.vis_ready = True
             continue
         now = time.monotonic()
         face = msg.get("face")
@@ -1302,6 +755,10 @@ def vision_result_loop(st: State, result_q, stop: threading.Event) -> None:
                     pid, pname, sim, is_new = _id_recognizer.recognize(
                         _rgb_small, face_box, face_kps)
                     if pid is not None:
+                        if _memory_mgr is not None:
+                            mem_name = _memory_mgr.get_facts(pid).get("name")
+                            if mem_name:
+                                pname = mem_name
                         with st.lock:
                             old_pid = st.current_person_id
                             st.current_person_id = pid
@@ -1403,18 +860,17 @@ def vision_result_loop(st: State, result_q, stop: threading.Event) -> None:
         if u_raw is not None:
             n_hit += 1
             miss_streak = 0
-            # 迟滞锁定:持续命中 LOCK_ON_S → locked=True
-            miss_run_start = None
-            if hit_run_start is None:
-                hit_run_start = now
-            if not locked and (now - hit_run_start) >= LOCK_ON_S:
+            hit_window.append(1)
+            _rate = sum(hit_window) / len(hit_window) if hit_window else 0.0
+            if not locked and len(hit_window) >= 3 and _rate >= LOCK_ON_RATE:
                 locked = True
                 _record_vis_event("vis.face_locked", "🔒 人脸锁定",
-                                  {"u": round(u_raw, 3), "v": round(v_raw, 3)})
+                                  {"u": round(u_raw, 3), "v": round(v_raw, 3),
+                                   "rate": round(_rate, 2)})
             u = fx(u_raw, now)
             v = fy(v_raw, now)
             with st.lock:
-                st.face_seen_at = now  # 始终更新(瞬时);behavior 用 face_locked
+                st.face_seen_at = now
                 st.face_locked = locked
             if integrate:
                 err_yaw = YAW_SIGN * (u - 0.5) * FOV_X_DEG
@@ -1434,20 +890,19 @@ def vision_result_loop(st: State, result_q, stop: threading.Event) -> None:
                                                  st.body_yaw_deg + NECK_REL_LIMIT))
                     st.track_pitch = float(np.clip(st.track_pitch + sp, -TRACK_PITCH_LIMIT, TRACK_PITCH_LIMIT))
             else:
-                t_prev_ctrl = now  # 非积分态:滤波/计时继续走,但不写头部目标
+                t_prev_ctrl = now
         else:
             miss_streak += 1
             t_prev_ctrl = now
-            # 迟滞丢锁:持续丢失 LOCK_OFF_S → locked=False
-            hit_run_start = None
-            if miss_run_start is None:
-                miss_run_start = now
-            if locked and (now - miss_run_start) >= LOCK_OFF_S:
+            hit_window.append(0)
+            _rate = sum(hit_window) / len(hit_window) if hit_window else 0.0
+            if locked and len(hit_window) >= LOCK_WIN and _rate < LOCK_OFF_RATE:
                 locked = False
                 with st.lock:
                     st.face_locked = False
-                _record_vis_event("vis.face_lost", "🔓 人脸丢失", {})
-            if miss_streak >= VIS_MISS_N:  # 1c:连续 N 帧漏检才重置滤波(防侧脸闪断)
+                _record_vis_event("vis.face_lost", "🔓 人脸丢失",
+                                  {"rate": round(_rate, 2)})
+            if miss_streak >= VIS_MISS_N:
                 fx.reset()
                 fy.reset()
 
@@ -1479,1150 +934,7 @@ def vision_result_loop(st: State, result_q, stop: threading.Event) -> None:
             infer_acc = []
 
 
-# ───────────────────────── ③听声转向:DOA 传感器线程(只感知,不动头)─────────────────────────
-def _read_doa(opener) -> tuple[float, bool] | None:
-    try:
-        with opener.open(DOA_URL, timeout=2.0) as r:
-            d = json.loads(r.read().decode("utf-8"))
-        return math.degrees(float(d["angle"])), bool(d["speech_detected"])
-    except Exception:
-        return None
-
-
-# ───────────────────────── VIS_DEBUG：MJPEG HTTP 调试预览服务 ─────────────────────────
-def vis_debug_server(st: State, port: int, stop: threading.Event) -> None:
-    """VIS_DEBUG=1 时启动 MJPEG HTTP 服务，浏览器打开 http://localhost:{port} 查看实时标注帧。
-    画面 = 视觉子进程实际看到的降采样帧（DECIMATE×），叠加：
-      蓝框=人脸(u,v,h)  绿框=有效手(score≥阈值)  黄框=低置信度手(可能误检)
-      左上角=状态机/头部目标/face_locked  右上角=帧时间戳"""
-    import cv2 as _cv2
-    import http.server
-    import socketserver
-
-    def _build_frame() -> bytes:
-        with st.lock:
-            rgb = st.dbg_frame_small
-            det = st.dbg_det
-            state_name = st.state
-            ty = st.track_yaw
-            tp = st.track_pitch
-            locked = st.face_locked
-            hand_at = st.hand_at
-            # DOA 字段
-            doa_resid = st.doa_resid_stable
-            doa_conf = st.doa_confident
-            doa_at = st.doa_at
-            body_yaw = st.body_yaw_deg
-            gate_open = st.dbg_gate_open
-            sw_active = st.dbg_switching
-            sw_phase = st.dbg_switch_phase
-            sw_target = st.dbg_switch_target
-            speaking = time.monotonic() < st.playback_end_estimate + 0.1
-
-        if rgb is None:
-            blank = np.zeros((360, 640, 3), dtype=np.uint8)
-            _cv2.putText(blank, "Waiting for frame...", (20, 180),
-                        _cv2.FONT_HERSHEY_SIMPLEX, 0.8, (180, 180, 180), 2)
-            _, jpg = _cv2.imencode(".jpg", blank)
-            return jpg.tobytes()
-
-        bgr = _cv2.cvtColor(rgb, _cv2.COLOR_RGB2BGR)
-        H, W = bgr.shape[:2]
-
-        # ── 人脸框（蓝色）──
-        if det and det.get("face") is not None:
-            fu, fv, fh = det["face"]
-            fw = fh * 0.85  # 估算宽高比
-            fx0 = int((fu - fw / 2) * W)
-            fy0 = int((fv - fh / 2) * H)
-            fx1 = int((fu + fw / 2) * W)
-            fy1 = int((fv + fh / 2) * H)
-            _cv2.rectangle(bgr, (fx0, fy0), (fx1, fy1), (255, 80, 0), 2)
-            label = f"FACE u={fu:.2f} v={fv:.2f} h={fh:.2f} n={det.get('n_faces',1)}"
-            _cv2.rectangle(bgr, (fx0, fy0 - 18), (fx0 + len(label) * 9, fy0), (255, 80, 0), -1)
-            _cv2.putText(bgr, label, (fx0 + 2, fy0 - 4),
-                         _cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-
-        # ── 手部框（绿=有效 / 黄=低置信 / 橙=底部过滤）──
-        if det and det.get("hand") is not None:
-            h = det["hand"]
-            hu, hv, hsize = h.get("u", 0.5), h.get("v", 0.5), h.get("size", 0.0)
-            hscore = h.get("score", 0.0)
-            # bbox: hsize is the max(dx,dy) in normalised coords — apply to each axis separately
-            half_w = int(hsize * W / 2)
-            half_h = int(hsize * H / 2)
-            hx0 = max(0, int(hu * W) - half_w)
-            hy0 = max(0, int(hv * H) - half_h)
-            hx1 = min(W - 1, int(hu * W) + half_w)
-            hy1 = min(H - 1, int(hv * H) + half_h)
-            valid = hscore >= PLAY_SCORE_MIN and hsize >= PLAY_SIZE_OFF and hv <= PLAY_HAND_V_MAX
-            color = (0, 200, 0) if valid else ((0, 120, 255) if hv > PLAY_HAND_V_MAX else (0, 200, 255))  # 绿/橙(底部)/黄
-            tag = "HAND" if valid else ("HAND(BOT)" if hv > PLAY_HAND_V_MAX else "HAND(LOW)")
-            _cv2.rectangle(bgr, (hx0, hy0), (hx1, hy1), color, 2)
-            fingers = h.get("fingers", -1)
-            gesture = h.get("gesture") or ""
-            g_str = f" [{gesture}]" if gesture else (f" {fingers}f" if fingers >= 0 else "")
-            hlabel = f"{tag} sz={hsize:.2f} sc={hscore:.2f} v={hv:.2f}{g_str}"
-            lbl_y = min(hy1 + 18, H - 4)
-            _cv2.rectangle(bgr, (hx0, lbl_y - 16), (hx0 + len(hlabel) * 9, lbl_y + 2), color, -1)
-            _cv2.putText(bgr, hlabel, (hx0 + 2, lbl_y - 2),
-                         _cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
-            # v-threshold line
-            vy = int(PLAY_HAND_V_MAX * H)
-            _cv2.line(bgr, (0, vy), (W, vy), (0, 120, 255), 1)
-            _cv2.putText(bgr, f"v_max={PLAY_HAND_V_MAX}", (4, vy - 4),
-                         _cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 120, 255), 1)
-
-        # ── 左上角：状态机信息（白字黑底）──
-        now_s = time.strftime("%H:%M:%S")
-        lines = [
-            f"[{state_name}]",
-            f"yaw={ty:+.1f}deg  pitch={tp:+.1f}deg",
-            f"face_locked={'Y' if locked else 'N'}  hand_age={time.monotonic()-hand_at:.1f}s",
-            now_s,
-        ]
-        for i, line in enumerate(lines):
-            y = 18 + i * 20
-            _cv2.rectangle(bgr, (0, y - 15), (len(line) * 9 + 4, y + 4), (0, 0, 0), -1)
-            _cv2.putText(bgr, line, (2, y),
-                         _cv2.FONT_HERSHEY_SIMPLEX, 0.48,
-                         (0, 255, 255) if i == 0 else (255, 255, 255), 1)
-
-        # ── 底部诊断行：区分"没检出"和"管线未写入"──
-        if det is None:
-            diag = "det=None  vision_result_loop not writing (crashed?)"
-            diag_color = (0, 0, 255)   # 红
-        else:
-            face_s = f"face={det['face']}" if det.get("face") else "face=None"
-            hand_s = f"hand=size{det['hand']['size']:.2f} score{det['hand']['score']:.2f}" if det.get("hand") else "hand=None"
-            diag = f"{face_s}  {hand_s}  n={det.get('n_faces',0)}"
-            diag_color = (0, 255, 0) if det.get("face") or det.get("hand") else (100, 100, 100)
-        _cv2.rectangle(bgr, (0, H - 22), (W, H), (0, 0, 0), -1)
-        _cv2.putText(bgr, diag, (4, H - 6),
-                     _cv2.FONT_HERSHEY_SIMPLEX, 0.42, diag_color, 1)
-
-        # ── DOA 弧条（底部第二行，高 38px）──
-        _doa_h = 38          # DOA 条高度
-        _doa_y0 = H - 22 - _doa_h  # 在底部诊断行上方
-        _doa_mx = 12         # 左右边距
-        _doa_range = 90.0    # ±90°
-        _gate_deg = GATE_DEG  # ±55° 门控范围
-
-        def _deg2x(deg: float) -> int:
-            return int(_doa_mx + (deg + _doa_range) / (2 * _doa_range) * (W - 2 * _doa_mx))
-
-        # 背景黑条
-        _cv2.rectangle(bgr, (0, _doa_y0), (W, H - 22), (20, 20, 20), -1)
-
-        # 门控范围背景：±GATE_DEG 内绿透明叠，外红透明叠
-        _gate_x0 = _deg2x(-_gate_deg)
-        _gate_x1 = _deg2x(_gate_deg)
-        _overlay = bgr.copy()
-        _cv2.rectangle(_overlay, (_doa_mx, _doa_y0 + 2), (_gate_x0, H - 24), (0, 0, 80), -1)   # 左侧超范围=红
-        _cv2.rectangle(_overlay, (_gate_x1, _doa_y0 + 2), (W - _doa_mx, H - 24), (0, 0, 80), -1)  # 右侧超范围=红
-        _cv2.rectangle(_overlay, (_gate_x0, _doa_y0 + 2), (_gate_x1, H - 24), (0, 60, 0), -1)  # 范围内=绿
-        _cv2.addWeighted(_overlay, 0.4, bgr, 0.6, 0, bgr)
-
-        # 刻度线：画面左=机器人左(resid+)，画面右=机器人右(resid-)
-        for _d in (-90, -60, -30, 0, 30, 60, 90):
-            _tx = _deg2x(float(-_d))
-            _cv2.line(bgr, (_tx, _doa_y0 + 2), (_tx, _doa_y0 + 8), (120, 120, 120), 1)
-            if _d != 0:
-                _lbl = f"{_d:+d}"
-                _cv2.putText(bgr, _lbl, (_tx - 10, _doa_y0 + 20),
-                             _cv2.FONT_HERSHEY_SIMPLEX, 0.33, (120, 120, 120), 1)
-            else:
-                _cv2.line(bgr, (_tx, _doa_y0 + 2), (_tx, _doa_y0 + 14), (180, 180, 180), 1)
-
-        # body_yaw 三角标（白色，朝下）
-        _bx = _deg2x(float(np.clip(-body_yaw, -_doa_range, _doa_range)))
-        _tri = np.array([[_bx, _doa_y0 + 2], [_bx - 5, _doa_y0 + 10], [_bx + 5, _doa_y0 + 10]], np.int32)
-        _cv2.fillPoly(bgr, [_tri], (220, 220, 220))
-        _cv2.putText(bgr, "H", (_bx - 4, _doa_y0 + 10),
-                     _cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 0, 0), 1)
-
-        # 切换目标角（橙色三角，朝上，切换中才显示）
-        if sw_active:
-            _sx = _deg2x(float(np.clip(-sw_target, -_doa_range, _doa_range)))
-            _stri = np.array([[_sx, H - 25], [_sx - 5, H - 33], [_sx + 5, H - 33]], np.int32)
-            _cv2.fillPoly(bgr, [_stri], (0, 130, 255))  # 橙
-
-        # DOA 方向箭头（主指示器，从中央向外）
-        _doa_fresh = doa_resid is not None and (time.monotonic() - doa_at) < DOA_GATE_FRESH_S
-        if doa_resid is not None:
-            _dx = _deg2x(float(np.clip(-doa_resid, -_doa_range, _doa_range)))
-            _cy_bar = (_doa_y0 + H - 22) // 2
-            if doa_conf and _doa_fresh:
-                _arrow_c = (0, 220, 0)   # 绿：confident + fresh
-            elif _doa_fresh:
-                _arrow_c = (0, 180, 255)  # 橙：fresh 但不 confident
-            else:
-                _arrow_c = (80, 80, 80)   # 灰：stale
-            _cv2.arrowedLine(bgr, (_deg2x(0.0), _cy_bar), (_dx, _cy_bar),
-                             _arrow_c, 2, tipLength=0.2)
-            _cv2.circle(bgr, (_dx, _cy_bar), 4, _arrow_c, -1)
-
-        # 右下角 DOA 文字状态
-        _now_m = time.monotonic()
-        _fresh_s = f"{_now_m - doa_at:.1f}s" if doa_resid is not None else "—"
-        _resid_s = f"{doa_resid:+.0f}°" if doa_resid is not None else "—"
-        _gate_s = "OPEN" if gate_open else "BLOCK"
-        _gate_c = (0, 220, 0) if gate_open else (0, 0, 220)
-        _spk_s = "SPK" if speaking else ""
-        _sw_s = f"SW:{sw_phase}" if sw_active else ""
-        _conf_s = "conf" if doa_conf else "unc"
-        _doa_line = f"DOA {_resid_s} {_conf_s} {_fresh_s}  gate:{_gate_s}  {_sw_s}  {_spk_s}"
-        _txt_w = len(_doa_line) * 8 + 4
-        _cv2.rectangle(bgr, (W - _txt_w - 2, _doa_y0 + 2), (W - 2, _doa_y0 + 18), (0, 0, 0), -1)
-        _cv2.putText(bgr, _doa_line, (W - _txt_w, _doa_y0 + 14),
-                     _cv2.FONT_HERSHEY_SIMPLEX, 0.38, _gate_c, 1)
-
-        _, jpg = _cv2.imencode(".jpg", bgr, [_cv2.IMWRITE_JPEG_QUALITY, 75])
-        return jpg.tobytes()
-
-    _VIS_HTML = """<!DOCTYPE html>
-<html lang="zh"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>小艺 Debug</title>
-<style>
-:root{--bg:#09090f;--card:#131320;--bdr:#1e1e30;--txt:#dde1ea;--muted:#505877;
-     --green:#22d3a0;--red:#f25e6b;--orange:#f5a623;--blue:#38bdf8;--purple:#a78bfa;
-     --mono:'SF Mono','Fira Code',Consolas,monospace}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;background:var(--bg);color:var(--txt);font:13px/1.4 system-ui,sans-serif;overflow:hidden}
-#hdr{display:flex;align-items:center;gap:10px;padding:5px 14px;background:var(--card);
-     border-bottom:1px solid var(--bdr);height:40px;flex-shrink:0}
-#hdr h1{font-size:14px;font-weight:600;letter-spacing:-.2px}
-.badge{padding:2px 10px;border-radius:20px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
-.ba{background:#1a1a2e;color:var(--muted)}.be{background:#3d2000;color:#fbbf24}
-.bt{background:#003d28;color:var(--green)}.bs{background:#001d3d;color:var(--blue)}
-.bp{background:#2a0057;color:var(--purple)}.br{background:#3d0010;color:var(--red)}
-/* tab bar */
-#tabs{display:flex;gap:2px;margin-left:16px}
-.tab{padding:4px 14px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;color:var(--muted);background:transparent;border:1px solid transparent;transition:.15s}
-.tab.active{background:var(--card);border-color:var(--bdr);color:var(--txt)}
-.tab:hover:not(.active){color:var(--txt)}
-#dot{margin-left:auto;width:7px;height:7px;border-radius:50%;background:var(--muted);transition:background .4s}
-#dot.ok{background:var(--green)}
-/* views */
-#view-camera,#view-conv{height:calc(100vh - 40px);display:none}
-#view-camera.active,#view-conv.active{display:grid}
-/* ── Camera view ── */
-#view-camera{grid-template-columns:1fr 304px;grid-template-rows:1fr 200px;gap:5px;padding:5px}
-#cv{background:#000;border-radius:8px;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center}
-#cv img{max-width:100%;max-height:100%;object-fit:contain;display:block}
-#cv-lbl{position:absolute;bottom:8px;left:8px;background:rgba(0,0,0,.65);padding:2px 8px;border-radius:4px;font:10px var(--mono);color:var(--muted)}
-#side{display:flex;flex-direction:column;gap:5px}
-.card{background:var(--card);border:1px solid var(--bdr);border-radius:8px;padding:10px}
-.ch{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);margin-bottom:8px}
-#rc{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}
-canvas{display:block;margin:0 auto}
-.sr{display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid var(--bdr);gap:8px}
-.sr:last-child{border:none}
-.sl{color:var(--muted);white-space:nowrap;font-size:12px}
-.sv{font:11px var(--mono);text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#lw{grid-column:1/3;background:var(--card);border:1px solid var(--bdr);border-radius:8px;display:flex;flex-direction:column;overflow:hidden}
-#lh{padding:5px 12px;border-bottom:1px solid var(--bdr);flex-shrink:0;display:flex;align-items:center;gap:8px}
-#lh span{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.7px;color:var(--muted)}
-#lb{flex:1;overflow-y:auto;padding:4px 12px;font:11px/1.75 var(--mono);min-height:0}
-.ll{white-space:pre-wrap;word-break:break-all}
-.lk{color:var(--green)}.lw2{color:var(--orange)}.le{color:var(--red)}.ld{color:#6366f1}.lm{color:#4b5563}
-/* ── Conversation view ── */
-#view-conv{grid-template-columns:320px 1fr;grid-template-rows:1fr 180px 44px;gap:5px;padding:5px}
-#turn-list{overflow-y:auto;display:flex;flex-direction:column;gap:4px;padding-right:2px}
-.turn-card{background:var(--card);border:1px solid var(--bdr);border-radius:8px;padding:8px 10px;cursor:pointer;transition:border-color .15s,background .15s;height:auto;overflow:visible}
-.turn-card:hover{border-color:var(--blue)}
-.turn-card.selected{border-color:var(--blue);background:#0d1a26}
-.tc-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
-.tc-id{font:10px var(--mono);color:var(--blue);font-weight:700}
-.tc-ts{font:10px var(--mono);color:var(--muted)}
-.tc-row{font-size:11px;color:var(--muted);padding:1px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tc-row .em{margin-right:4px}
-.tc-asr{color:var(--txt)}
-.tc-out{color:var(--green)}
-.tc-tool{color:var(--orange)}
-.tc-vlm{color:var(--purple)}
-.tc-fb{color:var(--blue);font:10px var(--mono)}
-.tc-ctx{font:10px var(--mono);color:#6366f1;opacity:.7;padding:2px 0 3px;border-bottom:1px solid #1a1a2e;margin-bottom:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#event-panel{background:var(--card);border:1px solid var(--bdr);border-radius:8px;display:flex;flex-direction:column;overflow:hidden}
-#ep-hdr{padding:5px 12px;border-bottom:1px solid var(--bdr);flex-shrink:0;font:10px var(--mono);color:var(--muted);display:flex;gap:12px;align-items:center}
-#ep-list{flex:1;overflow-y:auto;font:11px var(--mono)}
-.ev{display:grid;grid-template-columns:36px 84px 200px 1fr;gap:0 8px;padding:3px 10px;border-bottom:1px solid #0d0d18;cursor:pointer;align-items:center}
-.ev:hover{background:#0d1020}
-.ev.hl{background:#0d1a26;border-left:2px solid var(--blue)}
-.ev .es{color:var(--muted);font-size:10px}
-.ev .ets{color:var(--muted);font-size:10px}
-.ev .ety{color:#6366f1;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ev .elb{color:var(--txt);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ev.role-user .elb{color:var(--blue)}
-.ev.role-model .elb{color:var(--green)}
-.ev.role-tool .elb{color:var(--orange)}
-.ev.role-system .elb{color:var(--muted)}
-/* Issue#2: highlight overlay for filtered events */
-.ev.ev-hl{background:#0c1820;border-left:3px solid var(--blue)}
-.ev.ev-hl .ety{color:#818cf8}
-.ev.ev-dim{opacity:.28}
-/* timeline canvas */
-#timeline-wrap{grid-column:1/3;background:var(--card);border:1px solid var(--bdr);border-radius:8px;overflow:hidden;position:relative;display:flex;flex-direction:column}
-#tl-lanes{position:absolute;left:0;top:0;bottom:0;width:44px;background:var(--card);z-index:2;border-right:1px solid var(--bdr);pointer-events:none}
-#tl-scroll{flex:1;overflow-x:auto;overflow-y:hidden;position:relative;padding-left:44px}
-#tl-latest-btn{position:absolute;right:10px;bottom:6px;background:#1e3a5f;border:1px solid #38bdf8;color:#38bdf8;font:11px system-ui;padding:3px 10px;border-radius:12px;cursor:pointer;z-index:10;display:none;opacity:.9}
-#tl-latest-btn:hover{opacity:1}
-#tl-tip{position:fixed;background:#1e1e2e;border:1px solid #374151;color:#e5e7eb;font:11px monospace;padding:4px 8px;border-radius:6px;pointer-events:none;z-index:200;display:none;max-width:280px;white-space:pre-wrap;line-height:1.4}
-#timeline{display:block;height:100%}
-/* feedback bar */
-#fb-bar{grid-column:1/3;background:var(--card);border:1px solid var(--bdr);border-radius:8px;
-        display:flex;align-items:center;gap:10px;padding:0 14px}
-#fb-btn{padding:4px 16px;border-radius:20px;border:1px solid var(--bdr);background:#1a1a2e;color:var(--muted);
-        font-size:12px;cursor:pointer;user-select:none;transition:.15s}
-#fb-btn.recording{background:#3d0010;color:var(--red);border-color:var(--red)}
-#fb-status{flex:1;font:11px var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* modal */
-#payload-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;align-items:center;justify-content:center}
-#payload-modal.open{display:flex}
-#payload-box{background:var(--card);border:1px solid var(--bdr);border-radius:10px;max-width:700px;width:90%;max-height:80vh;display:flex;flex-direction:column}
-#pb-hdr{padding:10px 16px;border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:10px}
-#pb-hdr h3{flex:1;font-size:13px}
-#pb-close{background:none;border:none;color:var(--muted);font-size:18px;cursor:pointer;line-height:1}
-#pb-body{flex:1;overflow-y:auto;padding:12px 16px;font:11px/1.7 var(--mono);color:var(--txt);white-space:pre-wrap;word-break:break-all}
-</style></head>
-<body>
-<div id="hdr">
-  <h1>&#x1F916; 小艺 Reachy Mini &mdash; Debug Dashboard</h1>
-  <div id="tabs">
-    <div class="tab active" onclick="switchTab('camera')">Camera</div>
-    <div class="tab" onclick="switchTab('conv')">Conversation</div>
-  </div>
-  <span id="badge" class="badge ba">—</span>
-  <div id="dot"></div>
-</div>
-
-<!-- Camera view -->
-<div id="view-camera" class="active">
-  <div id="cv">
-    <img src="/video" alt="">
-    <div id="cv-lbl">Camera &middot; VIS_DEBUG annotations</div>
-  </div>
-  <div id="side">
-    <div class="card" id="rc">
-      <div class="ch">声源方向 &middot; 世界坐标 (0\xb0=正前)</div>
-      <canvas id="radar" width="280" height="206"></canvas>
-    </div>
-    <div class="card">
-      <div class="ch">系统状态</div>
-      <div class="sr"><span class="sl">状态机</span><span class="sv" id="ss"></span></div>
-      <div class="sr"><span class="sl">收发音</span><span class="sv" id="sp"></span></div>
-      <div class="sr"><span class="sl">声源(世界)</span><span class="sv" id="sd"></span></div>
-      <div class="sr"><span class="sl">方向门控</span><span class="sv" id="sg"></span></div>
-      <div class="sr"><span class="sl">切换</span><span class="sv" id="sw"></span></div>
-      <div class="sr"><span class="sl">头/身偏航</span><span class="sv" id="sy"></span></div>
-    </div>
-  </div>
-  <div id="lw">
-    <div id="lh"><span>实时日志</span><span id="lc" style="margin-left:auto;color:#374151"></span></div>
-    <div id="lb"></div>
-  </div>
-</div>
-
-<!-- Conversation view -->
-<div id="view-conv">
-  <div id="turn-list"></div>
-  <div id="event-panel">
-    <div id="ep-hdr">
-      <span id="ep-title">全部事件</span>
-      <span id="ep-count" style="color:#374151"></span>
-      <span style="margin-left:auto;cursor:pointer;color:#6366f1" onclick="clearFilter()">清除过滤</span>
-    </div>
-    <div id="ep-list"></div>
-  </div>
-  <div id="timeline-wrap">
-    <canvas id="tl-lanes"></canvas>
-    <div id="tl-scroll"><canvas id="timeline"></canvas></div>
-    <button id="tl-latest-btn" onclick="tlScrollToLatest()">▶ 滚到最新</button>
-  </div>
-  <div id="tl-tip"></div>
-  <div id="fb-bar">
-    <button id="fb-btn" onmousedown="startRec()" onmouseup="stopRec()" ontouchstart="startRec()" ontouchend="stopRec()">🎙️ 按住说反馈 <kbd style="font-size:10px;opacity:.6">[Space]</kbd></button>
-    <span id="fb-status">松开后自动 ASR 归档到当前轮次</span>
-  </div>
-</div>
-
-<!-- Payload modal -->
-<div id="payload-modal">
-  <div id="payload-box">
-    <div id="pb-hdr"><h3 id="pb-title">事件详情</h3><button id="pb-close" onclick="closeModal()">✕</button></div>
-    <div id="pb-body"></div>
-  </div>
-</div>
-
-<script>
-// ── Tab switching ──
-function switchTab(name){
-  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',['camera','conv'][i]===name));
-  document.getElementById('view-camera').classList.toggle('active',name==='camera');
-  document.getElementById('view-conv').classList.toggle('active',name==='conv');
-  if(name==='conv') drawTimeline();
-}
-
-// ── Camera / DOA ──
-const GATE=55;
-const cv2=document.getElementById('radar'),cx=cv2.getContext('2d');
-const W=cv2.width,H=cv2.height,CX=W/2,CY=H/2,R=Math.min(CX,CY)-16;
-const y2r=d=>-(d*Math.PI/180)-Math.PI/2;
-function arw(d,len,col,lw,hs=9){
-  const r=y2r(d),ex=CX+Math.cos(r)*len,ey=CY+Math.sin(r)*len;
-  cx.beginPath();cx.moveTo(CX,CY);cx.lineTo(ex,ey);cx.strokeStyle=col;cx.lineWidth=lw;cx.stroke();
-  const a=.42;cx.beginPath();cx.moveTo(ex,ey);
-  cx.lineTo(ex-hs*Math.cos(r-a),ey-hs*Math.sin(r-a));cx.lineTo(ex-hs*Math.cos(r+a),ey-hs*Math.sin(r+a));
-  cx.closePath();cx.fillStyle=col;cx.fill();
-}
-function drawRadar(s){
-  cx.clearRect(0,0,W,H);cx.fillStyle='#0c0c18';cx.beginPath();cx.arc(CX,CY,R+14,0,Math.PI*2);cx.fill();
-  cx.lineWidth=1;cx.strokeStyle='#1a1a2a';
-  [.35,.7,1].forEach(f=>{cx.beginPath();cx.arc(CX,CY,R*f,0,Math.PI*2);cx.stroke()});
-  for(let a=0;a<360;a+=45){const r=y2r(a);cx.beginPath();cx.moveTo(CX,CY);cx.lineTo(CX+Math.cos(r)*R,CY+Math.sin(r)*R);cx.stroke()}
-  cx.font='bold 11px system-ui';cx.textAlign='center';cx.textBaseline='middle';
-  [[0,'前','#4ade80'],[90,'左','#94a3b8'],[-90,'右','#94a3b8'],[180,'后','#374151']].forEach(([d,t,c])=>{
-    const r=y2r(d);cx.fillStyle=c;cx.fillText(t,CX+Math.cos(r)*(R+11),CY+Math.sin(r)*(R+11));
-  });
-  const hy=s.track_yaw||0,r1=y2r(hy-GATE),r2=y2r(hy+GATE);
-  cx.beginPath();cx.moveTo(CX,CY);cx.arc(CX,CY,R*.9,r1,r2,true);cx.closePath();
-  cx.fillStyle='rgba(34,211,160,.09)';cx.fill();cx.strokeStyle='rgba(34,211,160,.22)';cx.lineWidth=1;cx.stroke();
-  const by=s.body_yaw_deg||0,rb=y2r(by);
-  cx.setLineDash([3,4]);cx.strokeStyle='#4b5563';cx.lineWidth=1.5;
-  cx.beginPath();cx.moveTo(CX,CY);cx.lineTo(CX+Math.cos(rb)*R*.75,CY+Math.sin(rb)*R*.75);cx.stroke();cx.setLineDash([]);
-  arw(hy,R*.72,'#38bdf8',2.5);
-  const dr=s.doa_resid_stable;
-  if(dr!=null){const wd=hy+dr,fr=s.doa_fresh,col=fr?(s.doa_confident?'#22d3a0':'#f5a623'):'#374151';
-    arw(wd,R*.88,col,2);const rr=y2r(wd);
-    cx.beginPath();cx.arc(CX+Math.cos(rr)*R*.88,CY+Math.sin(rr)*R*.88,4,0,Math.PI*2);cx.fillStyle=col;cx.fill();
-  }
-  if(s.switching&&s.switch_target){const rs=y2r(s.switch_target);
-    cx.beginPath();cx.arc(CX+Math.cos(rs)*R*.72,CY+Math.sin(rs)*R*.72,5,0,Math.PI*2);
-    cx.strokeStyle='#f97316';cx.lineWidth=2;cx.stroke();}
-  cx.beginPath();cx.arc(CX,CY,3,0,Math.PI*2);cx.fillStyle='#fff';cx.fill();
-  cx.font='10px monospace';cx.textAlign='left';cx.textBaseline='alphabetic';
-  const fr2=s.doa_fresh,co2=s.doa_confident,dr2=s.doa_resid_stable;
-  [['‒ ‒','#4b5563','身(body)'],['——','#38bdf8','头(head)'],
-   ['——',dr2!=null&&fr2?(co2?'#22d3a0':'#f5a623'):'#374151','声(world)']
-  ].forEach(([sym,c,t],i)=>{cx.fillStyle=c;cx.fillText(sym+' '+t,4,H-26+i*13)});
-}
-const $=id=>document.getElementById(id);
-const bmap={ARMED:'ba',ENGAGING:'be',TRACKING:'bt',SEEKING:'bs',SEARCHING:'bs',PLAYING:'bp',RETURNING:'br'};
-function sv(id,txt,col){const e=$(id);e.textContent=txt;if(col)e.style.color=col}
-function refreshCamera(s){
-  const b=$('badge');b.textContent=s.state||'—';b.className='badge '+(bmap[s.state]||'ba');
-  sv('ss',s.state||'—');
-  sv('sp',s.speaking?'🔊 说话中':'🎙️ 收听中',s.speaking?'#f97316':'#38bdf8');
-  const dr=s.doa_resid_stable,hy=s.track_yaw||0;
-  if(dr!=null&&s.doa_fresh){const w=hy+dr,dir=w>5?'←左':w<-5?'右→':'↑前';
-    sv('sd',(w>=0?'+':'')+w.toFixed(0)+'\xb0 '+dir+' '+(s.doa_confident?'●':'○'),s.doa_confident?'#22d3a0':'#f5a623');
-  }else sv('sd',dr!=null?(hy+dr).toFixed(0)+'\xb0(旧)':'—','#374151');
-  sv('sg',s.gate_open?'✓ 开放 (收音)':'✗ 静音 (门关)',s.gate_open?'#22d3a0':'#f25e6b');
-  sv('sw',s.switching?s.switch_phase+' → '+s.switch_target.toFixed(0)+'\xb0':'—',s.switching?'#f97316':'#374151');
-  const hv=(s.track_yaw||0).toFixed(1),bv=(s.body_yaw_deg||0).toFixed(1);
-  sv('sy','头 '+(hv>=0?'+':'')+hv+'\xb0  身 '+(bv>=0?'+':'')+bv+'\xb0');
-  drawRadar(s);
-}
-let logSeq=0;const lb=$('lb'),MAX=400;
-function lcls(t){
-  if(/❌|ERROR|Traceback/.test(t))return 'le';
-  if(/⚠|WARN|失败|failed/.test(t))return 'lw2';
-  if(/✅|👂|🎙|🤖|就绪|启动|成功/.test(t))return 'lk';
-  if(/KWS|raw=|resid=|IQR=|vad=/.test(t))return 'ld';
-  return 'lm';
-}
-function addLog(lines){
-  const bot=lb.scrollTop+lb.clientHeight>=lb.scrollHeight-40;
-  const f=document.createDocumentFragment();
-  lines.forEach(t=>{const d=document.createElement('div');d.className='ll '+lcls(t);d.textContent=t;f.appendChild(d)});
-  lb.appendChild(f);
-  while(lb.children.length>MAX)lb.removeChild(lb.firstChild);
-  if(bot)lb.scrollTop=lb.scrollHeight;
-  $('lc').textContent=lb.children.length+' lines';
-}
-
-// ── Conversation view ──
-let convSeq=0, allEvents=[], allTurns=[], allFeedback=[], feedbackDir='';
-let selectedTurnId=null, filterTurnId=null;
-// timeline navigation state
-let tlNodes=[], tlSelIdx=-1;
-
-function renderTurnCard(t){
-  const fbCount=allFeedback.filter(f=>f.turn_id===t.turn_id).length;
-  const d=document.createElement('div');
-  // Issue#4 fix: set class directly here (no separate classList.toggle pass needed)
-  d.className='turn-card'+(selectedTurnId===t.turn_id?' selected':'');
-  d.dataset.tid=t.turn_id;
-  d.onclick=()=>selectTurn(t.turn_id);
-  const dur=t.end_mono&&t.start_mono?(t.end_mono-t.start_mono).toFixed(1)+'s':'…';
-  // Issue#1 fix: use turn_num (sequential 1,2,3…) instead of turn_id (event seq, has gaps)
-  const numLabel=t.turn_num!=null?t.turn_num:t.turn_id;
-  // context: vis/behavior events that preceded this turn
-  const ctxHtml=(t.context&&t.context.length)
-    ?`<div class="tc-ctx">${t.context.map(c=>`<span>${esc(c)}</span>`).join(' · ')}</div>`:
-    '';
-  d.innerHTML=`<div class="tc-hdr"><span class="tc-id">Turn #${numLabel}</span><span class="tc-ts">${t.start_ts||''} (${dur})</span></div>`+
-    ctxHtml+
-    (t.asr?`<div class="tc-row tc-asr"><span class="em">🎤</span>${esc(t.asr.slice(0,80))}</div>`:'<div class="tc-row" style="color:#374151">（等待 ASR…）</div>')+
-    t.tool_calls.map(tc=>`<div class="tc-row tc-tool"><span class="em">🤖</span>${esc(tc.name)}`+(tc.output_preview?` <span style="color:#9ca3af">→ ${esc(tc.output_preview.slice(0,40))}</span>`:'')+`</div>`).join('')+
-    (t.snapshot_desc?`<div class="tc-row tc-vlm"><span class="em">🖼️</span>${esc(t.snapshot_desc.slice(0,80))}</div>`:'')+
-    (t.transcript?`<div class="tc-row tc-out"><span class="em">🔊</span>${esc(t.transcript.slice(0,80))}</div>`:'')+
-    (fbCount?`<div class="tc-fb">📌 ${fbCount} 条反馈</div>`:'');
-  return d;
-}
-
-function refreshTurnList(){
-  const list=$('turn-list');
-  const scrolled=list.scrollTop+list.clientHeight>=list.scrollHeight-60;
-  // Issue#4 fix: full re-render ensures selected class is always in sync with selectedTurnId.
-  // diff by innerHTML to avoid thrashing, but always re-create when selected state might differ.
-  const existing=new Map([...list.querySelectorAll('.turn-card')].map(e=>[+e.dataset.tid,e]));
-  allTurns.forEach(t=>{
-    const el=existing.get(t.turn_id);
-    const fresh=renderTurnCard(t);
-    if(!el){
-      list.appendChild(fresh);
-    } else {
-      // always replace if selected state changed OR content changed
-      const wasSelected=el.classList.contains('selected');
-      const nowSelected=(selectedTurnId===t.turn_id);
-      if(wasSelected!==nowSelected||el.innerHTML!==fresh.innerHTML){
-        list.replaceChild(fresh,el);
-      }
-    }
-  });
-  if(scrolled)list.scrollTop=list.scrollHeight;
-}
-
-function selectTurn(tid){
-  // Clicking a card sets selectedTurnId (border highlight) but NOT filterTurnId.
-  // filterTurnId is only set by explicit filter buttons if any. Scroll + card highlight only.
-  selectedTurnId=tid;
-  refreshTurnList();
-  const turn=allTurns.find(t=>t.turn_id===tid);
-  scrollCardIntoView(tid);
-  // highlight this turn's events in event list without locking filter
-  if(turn){
-    const hlSeqs=new Set(turn.events);
-    document.querySelectorAll('.ev').forEach(el=>{
-      const s=+el.dataset.seq;
-      el.classList.toggle('ev-hl',hlSeqs.has(s));
-      el.classList.toggle('ev-dim',!hlSeqs.has(s));
-    });
-    const first=document.querySelector('.ev.ev-hl');
-    if(first)setTimeout(()=>first.scrollIntoView({behavior:'smooth',block:'center'}),50);
-    const numLabel=turn.turn_num!=null?turn.turn_num:tid;
-    $('ep-title').textContent='Turn #'+numLabel+' 事件';
-  }
-  drawTimeline();
-}
-function clearFilter(){
-  filterTurnId=null;selectedTurnId=null;tlSelNode=null;
-  $('ep-title').textContent='全部事件';
-  refreshTurnList();renderEventList();drawTimeline();
-}
-
-// Smart scroll: scroll turn-list so the card is fully visible with minimum movement
-function scrollCardIntoView(tid){
-  const list=$('turn-list');
-  const card=document.querySelector(`.turn-card[data-tid="${tid}"]`);
-  if(!card)return;
-  const listRect=list.getBoundingClientRect();
-  const cardRect=card.getBoundingClientRect();
-  const topOff=cardRect.top-listRect.top;    // card top relative to list visible area
-  const botOff=cardRect.bottom-listRect.bottom; // positive = card bottom is below list bottom
-  if(topOff<0){
-    // card top is hidden above — scroll up just enough
-    list.scrollTop+=topOff-6;
-  } else if(botOff>0){
-    // card bottom is hidden below — scroll down just enough
-    list.scrollTop+=botOff+6;
-  }
-  // if both partially visible and card is taller than list, prefer showing top
-  if(cardRect.height>listRect.height) list.scrollTop+=topOff-6;
-}
-
-function getFilteredSeqs(){
-  if(filterTurnId==null)return null;
-  const t=allTurns.find(t=>t.turn_id===filterTurnId);
-  return t?new Set(t.events):new Set();
-}
-
-// Issue#2 fix: render ALL events, highlight the ones in the selected turn with overlay
-function renderEventList(){
-  const hlSeqs=getFilteredSeqs(); // null=no filter, Set=highlight these
-  const evs=allEvents; // always show all events
-  const list=$('ep-list');
-  const bot=list.scrollTop+list.clientHeight>=list.scrollHeight-40;
-  list.innerHTML='';
-  const f=document.createDocumentFragment();
-  let firstHl=null;
-  evs.forEach(e=>{
-    const d=document.createElement('div');
-    const isHl=hlSeqs==null||hlSeqs.has(e.seq);
-    d.className=`ev role-${e.role}`+(isHl&&hlSeqs!=null?' ev-hl':'')+(hlSeqs!=null&&!isHl?' ev-dim':'');
-    d.dataset.seq=e.seq;
-    d.innerHTML=`<span class="es">${e.seq}</span><span class="ets">${e.ts.slice(0,12)}</span><span class="ety">${esc(e.type)}</span><span class="elb">${esc(e.label)}</span>`;
-    d.onclick=()=>openModal(e);
-    f.appendChild(d);
-    if(isHl&&hlSeqs!=null&&firstHl==null)firstHl=d;
-  });
-  list.appendChild(f);
-  $('ep-count').textContent=(hlSeqs!=null?hlSeqs.size+'/':'')+evs.length+' events';
-  // scroll to first highlighted event
-  if(firstHl)setTimeout(()=>firstHl.scrollIntoView({behavior:'smooth',block:'center'}),50);
-  else if(bot)list.scrollTop=list.scrollHeight;
-}
-
-// timeline
-const LANES=['user','model','tool','system'];
-const LANE_LABELS={'user':'User','model':'Model','tool':'Tool','system':'Sys'};
-const LANE_COLORS={'user':'#38bdf8','model':'#22d3a0','tool':'#f5a623','system':'#6366f1'};
-const LANE_H=36;
-const TL_LABEL_W=44;   // sticky lane-label column width
-const TL_PAD_R=12, TL_PAD_T=6;
-const TL_MIN_PX=24;    // minimum pixels per event (controls scroll width)
-const TL_DOT_R=4;
-let tlSelNode=null;
-let tlAutoScroll=true;  // auto-follow latest; set false when user manually scrolls
-
-function tlHeight(){return LANES.length*LANE_H+TL_PAD_T*2;}
-
-function drawLaneLabels(){
-  const canvas=$('tl-lanes');
-  const H2=tlHeight();
-  canvas.width=TL_LABEL_W; canvas.height=H2;
-  const c=canvas.getContext('2d');
-  c.fillStyle='#0d0d18'; c.fillRect(0,0,TL_LABEL_W,H2);
-  LANES.forEach((l,i)=>{
-    const y=TL_PAD_T+i*LANE_H+LANE_H/2;
-    c.fillStyle=LANE_COLORS[l]; c.font='9px system-ui';
-    c.textAlign='center'; c.textBaseline='middle';
-    c.fillText(LANE_LABELS[l], TL_LABEL_W/2, y);
-    c.strokeStyle='#1a1a2a'; c.lineWidth=1;
-    c.beginPath(); c.moveTo(0,y+LANE_H/2); c.lineTo(TL_LABEL_W,y+LANE_H/2); c.stroke();
-  });
-}
-
-function drawTimeline(){
-  const wrap=$('tl-scroll');
-  const canvas=$('timeline');
-  if(!allEvents.length){canvas.width=wrap.clientWidth||400;canvas.height=tlHeight();return;}
-
-  const displayEvs=allEvents.slice(-600);
-  // compute canvas width: enough pixels per event, at least fill container
-  const minW=Math.max(wrap.clientWidth||400, displayEvs.length*TL_MIN_PX+TL_PAD_R);
-  const H2=tlHeight();
-  canvas.width=minW; canvas.height=H2;
-
-  const c=canvas.getContext('2d');
-  c.fillStyle='#09090f'; c.fillRect(0,0,minW,H2);
-
-  const allMono=allEvents.map(e=>e.ts_mono);
-  const t0_full=Math.min(...allMono), t1_full=Math.max(...allMono);
-  const span=Math.max(t1_full-t0_full,1);
-  const cw=minW-TL_PAD_R;
-  const tx=t=>((t-t0_full)/span)*cw;
-
-  const filteredSeqs=filterTurnId!=null
-    ?(()=>{const turn=allTurns.find(t=>t.turn_id===filterTurnId);return turn?new Set(turn.events):new Set();})()
-    :null;
-
-  // draw turn background bands
-  allTurns.forEach(turn=>{
-    const ts=turn.start_mono, te=turn.end_mono||t1_full;
-    const x0=tx(ts), x1=tx(te);
-    const isSel=(turn.turn_id===filterTurnId);
-    c.fillStyle=isSel?'rgba(56,189,248,.08)':'rgba(255,255,255,.015)';
-    c.fillRect(x0,0,Math.max(x1-x0,2),H2);
-    if(isSel){
-      c.strokeStyle='rgba(56,189,248,.3)'; c.lineWidth=1;
-      c.beginPath(); c.moveTo(x0,0); c.lineTo(x0,H2); c.stroke();
-    }
-  });
-
-  // draw lane horizontal lines
-  LANES.forEach((_,i)=>{
-    const y=TL_PAD_T+i*LANE_H+LANE_H/2;
-    c.strokeStyle='#1a1a2a'; c.lineWidth=1;
-    c.beginPath(); c.moveTo(0,y); c.lineTo(minW,y); c.stroke();
-  });
-
-  // draw time tick marks every ~60px
-  const tickInterval=Math.max(1,(span/(cw/60)));
-  c.fillStyle='#374151'; c.font='8px monospace'; c.textAlign='center'; c.textBaseline='bottom';
-  for(let t=t0_full;t<=t1_full;t+=tickInterval){
-    const x=tx(t);
-    c.fillStyle='#1e1e2e'; c.fillRect(x-0.5,0,1,H2);
-    const s=((t-t0_full));
-    c.fillStyle='#4b5563'; c.fillText(s.toFixed(0)+'s',x,H2);
-  }
-
-  // draw events — no inline labels (shown on hover via tl-tip)
-  tlNodes=[];
-  displayEvs.forEach(e=>{
-    const li=LANES.indexOf(e.role); if(li<0)return;
-    const x=tx(e.ts_mono), y=TL_PAD_T+li*LANE_H+LANE_H/2;
-    const inFilter=!filteredSeqs||filteredSeqs.has(e.seq);
-    const isSelNode=tlSelNode&&tlSelNode.evSeq===e.seq;
-    const r=isSelNode?TL_DOT_R+2:TL_DOT_R;
-    c.globalAlpha=inFilter?1.0:0.18;
-    c.fillStyle=inFilter?LANE_COLORS[e.role]:'#374151';
-    c.beginPath(); c.arc(x,y,r,0,Math.PI*2); c.fill();
-    if(isSelNode){
-      c.strokeStyle='#fff'; c.lineWidth=1.5;
-      c.beginPath(); c.arc(x,y,r+2,0,Math.PI*2); c.stroke();
-    }
-    c.globalAlpha=1.0;
-    tlNodes.push({idx:tlNodes.length, evSeq:e.seq, x, y, role:e.role, laneIdx:li, event:e});
-  });
-  drawLaneLabels();
-  // auto-scroll: if tlAutoScroll=true, always jump to rightmost
-  if(tlAutoScroll) wrap.scrollLeft=wrap.scrollWidth;
-}
-
-// timeline click: move cursor only, no filter lock
-$('timeline').addEventListener('click',function(ev){
-  const rect=this.getBoundingClientRect();
-  const mx=ev.clientX-rect.left, my=ev.clientY-rect.top;
-  let best=null, bestD=Infinity;
-  tlNodes.forEach(n=>{
-    const d=Math.hypot(n.x-mx,n.y-my);
-    if(d<bestD){bestD=d;best=n;}
-  });
-  if(!best||bestD>18){clearFilter();return;}
-  tlSelNode=best;
-  const evEl=document.querySelector(`.ev[data-seq="${best.evSeq}"]`);
-  if(evEl){evEl.scrollIntoView({behavior:'smooth',block:'center'});}
-  const turn=allTurns.find(t=>t.events.includes(best.evSeq));
-  if(turn){scrollCardIntoView(turn.turn_id);}
-  drawTimeline();
-});
-
-// hover tooltip over timeline nodes
-(()=>{
-  const tip=$('tl-tip');
-  const canvas=$('timeline');
-  canvas.addEventListener('mousemove',function(ev){
-    const rect=this.getBoundingClientRect();
-    const mx=ev.clientX-rect.left, my=ev.clientY-rect.top;
-    let best=null, bestD=Infinity;
-    tlNodes.forEach(n=>{
-      const d=Math.hypot(n.x-mx,n.y-my);
-      if(d<bestD){bestD=d;best=n;}
-    });
-    if(!best||bestD>14){tip.style.display='none';return;}
-    const e=best.event;
-    tip.style.display='block';
-    tip.textContent=`[${e.ts.slice(0,12)}] ${e.type}\n${e.label}`;
-    // read dims after display:block so offsetWidth is valid
-    const tw=tip.offsetWidth||200, th=tip.offsetHeight||40;
-    const tx=Math.min(ev.clientX+14, window.innerWidth-tw-8);
-    const ty=Math.max(4,Math.min(ev.clientY-8, window.innerHeight-th-8));
-    tip.style.left=tx+'px'; tip.style.top=ty+'px';
-  });
-  canvas.addEventListener('mouseleave',()=>{tip.style.display='none';});
-})();
-
-// auto-scroll control: user scrolling pauses auto-follow; button resumes
-(()=>{
-  const s=$('tl-scroll');
-  const btn=$('tl-latest-btn');
-  let userScrolling=false;
-  s.addEventListener('scroll',()=>{
-    const atRight=s.scrollLeft>=s.scrollWidth-s.clientWidth-30;
-    if(atRight){
-      tlAutoScroll=true; btn.style.display='none';
-    } else {
-      if(tlAutoScroll){tlAutoScroll=false;}
-      btn.style.display='block';
-    }
-  },{passive:true});
-})();
-
-function tlScrollToLatest(){
-  tlAutoScroll=true;
-  $('tl-latest-btn').style.display='none';
-  const s=$('tl-scroll');
-  s.scrollLeft=s.scrollWidth;
-}
-
-// click blank area in event list → clear filter
-$('ep-list').addEventListener('click',function(ev){
-  if(ev.target===this) clearFilter();
-});
-// click blank area in turn-list → clear filter
-$('turn-list').addEventListener('click',function(ev){
-  if(ev.target===this) clearFilter();
-});
-// click blank area in conv view background → clear filter
-$('view-conv').addEventListener('click',function(ev){
-  const interactive=['turn-card','ev','fb-btn','tab'];
-  if(!interactive.some(c=>ev.target.closest('.'+c)||ev.target.closest('#'+c))){
-    clearFilter();
-  }
-});
-
-// Issue#4: arrow key navigation on timeline
-document.addEventListener('keydown',function(e){
-  const convActive=document.getElementById('view-conv').classList.contains('active');
-  if(e.code==='Space'&&!e.repeat&&convActive){e.preventDefault();startRec();return;}
-  if(!convActive||!tlNodes.length)return;
-  if(e.code==='ArrowLeft'||e.code==='ArrowRight'){
-    e.preventDefault();
-    const curLane=tlSelNode?tlSelNode.laneIdx:0;
-    const sameLane=tlNodes.filter(n=>n.laneIdx===curLane);
-    if(!sameLane.length)return;
-    const curPos=tlSelNode?sameLane.findIndex(n=>n.evSeq===tlSelNode.evSeq):-1;
-    const next=e.code==='ArrowRight'
-      ?sameLane[Math.min(curPos+1,sameLane.length-1)]
-      :sameLane[Math.max(curPos-1,0)];
-    if(next){tlSelNode=next;scrollToTlNode(next);drawTimeline();}
-  } else if(e.code==='ArrowUp'||e.code==='ArrowDown'){
-    e.preventDefault();
-    const curLane=tlSelNode?tlSelNode.laneIdx:0;
-    const nextLane=e.code==='ArrowDown'?Math.min(curLane+1,LANES.length-1):Math.max(curLane-1,0);
-    const laneEvs=tlNodes.filter(n=>n.laneIdx===nextLane);
-    if(!laneEvs.length)return;
-    const curMono=tlSelNode?tlSelNode.event.ts_mono:(allEvents[0]||{ts_mono:0}).ts_mono;
-    const next=laneEvs.reduce((a,b)=>Math.abs(b.event.ts_mono-curMono)<Math.abs(a.event.ts_mono-curMono)?b:a);
-    if(next){tlSelNode=next;scrollToTlNode(next);drawTimeline();}
-  }
-});
-document.addEventListener('keyup',function(e){
-  if(e.code==='Space'&&document.getElementById('view-conv').classList.contains('active')){e.preventDefault();stopRec();}
-});
-
-function scrollToTlNode(node){
-  // scroll timeline canvas to show selected node
-  const scroll=$('tl-scroll');
-  const visLeft=scroll.scrollLeft, visRight=scroll.scrollLeft+scroll.clientWidth;
-  if(node.x<visLeft+60||node.x>visRight-60){
-    scroll.scrollLeft=Math.max(0,node.x-scroll.clientWidth/2);
-  }
-  const el=document.querySelector(`.ev[data-seq="${node.evSeq}"]`);
-  if(el)el.scrollIntoView({behavior:'smooth',block:'nearest'});
-  const turn=allTurns.find(t=>t.events.includes(node.evSeq));
-  if(turn){
-    const card=document.querySelector(`.turn-card[data-tid="${turn.turn_id}"]`);
-    if(card)card.scrollIntoView({behavior:'smooth',block:'nearest'});
-  }
-}
-
-// modal
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function openModal(e){
-  $('pb-title').textContent=e.type;
-  $('pb-body').textContent=JSON.stringify(e.payload,null,2);
-  $('payload-modal').classList.add('open');
-}
-function closeModal(){$('payload-modal').classList.remove('open')}
-$('payload-modal').onclick=e=>{if(e.target===$('payload-modal'))closeModal()}
-
-// ── Recording feedback ──
-let mediaRec=null,recChunks=[],recTurnId=null;
-async function startRec(){
-  if(mediaRec)return;
-  try{
-    const stream=await navigator.mediaDevices.getUserMedia({audio:{sampleRate:16000,channelCount:1}});
-    mediaRec=new MediaRecorder(stream);recChunks=[];
-    recTurnId=selectedTurnId;
-    mediaRec.ondataavailable=e=>recChunks.push(e.data);
-    mediaRec.start(100);
-    $('fb-btn').classList.add('recording');
-    $('fb-status').textContent='🔴 录音中… (松开 Space 或按钮结束)';
-  }catch(e){
-    $('fb-status').textContent='⚠ 麦克风不可用: '+e.message;
-  }
-}
-async function stopRec(){
-  if(!mediaRec)return;
-  const rec=mediaRec; mediaRec=null;
-  rec.stop();
-  rec.stream.getTracks().forEach(t=>t.stop());
-  rec.onstop=async()=>{
-    if(!recChunks.length){$('fb-status').textContent='⚠ 未录到音频';return;}
-    const blob=new Blob(recChunks,{type:'audio/webm'});
-    const ab=await blob.arrayBuffer();
-    const b64=btoa(String.fromCharCode(...new Uint8Array(ab)));
-    $('fb-status').textContent='⏳ 识别中…';$('fb-btn').classList.remove('recording');
-    try{
-      const r=await fetch('/feedback',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({audio_b64:b64,turn_id:recTurnId})});
-      const d=await r.json();
-      const loc=feedbackDir?` | 归档: ${feedbackDir}/feedback_*.jsonl`:'';
-      $('fb-status').textContent='📌 已归档: '+d.transcript+loc;
-    }catch(e){$('fb-status').textContent='⚠ 归档失败: '+e.message;}
-  };
-}
-
-// ── Main poll loop ──
-const dot=$('dot');let conn=false;
-async function poll(){
-  try{
-    const url=`/state.json?after=${logSeq}&after_conv=${convSeq}`;
-    const r=await fetch(url,{cache:'no-store'});
-    if(r.ok){
-      const s=await r.json();
-      if(!conn){dot.classList.add('ok');conn=true}
-      logSeq=s.log_seq||logSeq;
-      if(s.new_logs&&s.new_logs.length)addLog(s.new_logs);
-      refreshCamera(s);
-      // conv
-      if(s.conv_events&&s.conv_events.length){
-        allEvents.push(...s.conv_events);
-        if(allEvents.length>2000)allEvents=allEvents.slice(-2000);
-        convSeq=s.conv_seq||convSeq;
-      }
-      if(s.conv_turns)allTurns=s.conv_turns;
-      if(s.feedback)allFeedback=s.feedback;
-      if(s.feedback_dir)feedbackDir=s.feedback_dir;
-      if(document.getElementById('view-conv').classList.contains('active')){
-        refreshTurnList();renderEventList();drawTimeline();
-      }
-    }
-  }catch(e){dot.classList.remove('ok');conn=false}
-  setTimeout(poll,250);
-}
-poll();
-window.addEventListener('resize',()=>{if(document.getElementById('view-conv').classList.contains('active'))drawTimeline()});
-</script></body></html>"""
-
-    class _Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
-        def do_GET(self):
-            path = self.path.split("?", 1)[0]
-            if path in ("/", "/index.html"):
-                self._html()
-            elif path == "/video":
-                self._mjpeg()
-            elif path == "/state.json":
-                self._state()
-            else:
-                self.send_error(404)
-
-        def _html(self):
-            body = _VIS_HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def _mjpeg(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-            self.end_headers()
-            try:
-                while not stop.is_set():
-                    data = _build_frame()
-                    self.wfile.write(
-                        b"--frame\r\nContent-Type: image/jpeg\r\n"
-                        b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n"
-                        + data + b"\r\n"
-                    )
-                    time.sleep(1 / 15)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-
-        def _state(self):
-            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
-            after = 0
-            after_conv = 0
-            for part in qs.split("&"):
-                if part.startswith("after="):
-                    try:
-                        after = int(part[6:])
-                    except ValueError:
-                        pass
-                elif part.startswith("after_conv="):
-                    try:
-                        after_conv = int(part[11:])
-                    except ValueError:
-                        pass
-            now = time.monotonic()
-            with st.lock:
-                data = {
-                    "state": st.state,
-                    "track_yaw": st.track_yaw,
-                    "track_pitch": st.track_pitch,
-                    "body_yaw_deg": st.body_yaw_deg,
-                    "face_locked": st.face_locked,
-                    "speaking": now < st.playback_end_estimate + 0.1,
-                    "doa_resid_stable": st.doa_resid_stable,
-                    "doa_confident": st.doa_confident,
-                    "doa_fresh": (
-                        st.doa_resid_stable is not None
-                        and (now - st.doa_at) < DOA_GATE_FRESH_S
-                    ),
-                    "gate_open": st.dbg_gate_open,
-                    "switching": st.dbg_switching,
-                    "switch_phase": st.dbg_switch_phase,
-                    "switch_target": st.dbg_switch_target,
-                    "identity_pid": st.current_person_id,
-                    "identity_name": st.current_person_name,
-                }
-            data["log_seq"] = _vis_log_seq
-            data["new_logs"] = [t for s, t in _vis_log_buf if s > after]
-            # 对话可视化增量字段
-            data["conv_seq"] = _conv_seq
-            data["conv_events"] = [e for e in _conv_events if e["seq"] > after_conv]
-            data["conv_turns"] = _conv_turns[-30:]
-            data["feedback"] = _feedback_notes[-50:]
-            data["feedback_dir"] = SNAP_DIR
-            data["instructions"] = INSTRUCTIONS  # 前端首次拿到后可缓存
-            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_POST(self):
-            path = self.path.split("?", 1)[0]
-            if path == "/feedback":
-                self._feedback()
-            else:
-                self.send_error(405)
-
-        def _feedback(self):
-            global _feedback_seq
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(length).decode("utf-8"))
-                audio_b64 = body.get("audio_b64", "")
-                turn_id = body.get("turn_id")
-                note_ts = time.strftime("%H:%M:%S")
-                # 尝试 DashScope ASR
-                transcript = ""
-                try:
-                    import dashscope
-                    from dashscope.audio.asr import Recognition
-                    import tempfile, os as _os
-                    audio_bytes = base64.b64decode(audio_b64)
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                        f.write(audio_bytes)
-                        tmp_path = f.name
-                    rec = Recognition(model="paraformer-realtime-v2",
-                                      format="wav", sample_rate=16000,
-                                      callback=None)
-                    result = rec.call(tmp_path)
-                    _os.unlink(tmp_path)
-                    if result and hasattr(result, "output"):
-                        sentences = getattr(result.output, "sentence", []) or []
-                        transcript = "".join(s.get("text", "") for s in sentences)
-                except Exception as asr_e:
-                    transcript = f"(ASR 不可用: {type(asr_e).__name__})"
-                _feedback_seq += 1
-                note = {"id": _feedback_seq, "ts": note_ts,
-                        "transcript": transcript, "turn_id": turn_id,
-                        "audio_b64": audio_b64}
-                _feedback_notes.append(note)
-                log(f"📌 反馈笔记 #{_feedback_seq}: {transcript[:60]}")
-                # 持久化到磁盘
-                try:
-                    os.makedirs(SNAP_DIR, exist_ok=True)
-                    fb_path = os.path.join(SNAP_DIR, f"feedback_{time.strftime('%Y%m%d')}.jsonl")
-                    with open(fb_path, "a", encoding="utf-8") as _ff:
-                        _ff.write(json.dumps(note, ensure_ascii=False) + "\n")
-                except Exception as _pe:
-                    log(f"⚠ 反馈写盘失败:{_pe}")
-                resp = json.dumps({"ok": True, "transcript": transcript,
-                                   "id": _feedback_seq}, ensure_ascii=False).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(resp)))
-                self.end_headers()
-                self.wfile.write(resp)
-            except Exception as e:
-                self.send_error(500, str(e))
-
-    class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
-        daemon_threads = True
-        allow_reuse_address = True
-
-    try:
-        server = _Server(("0.0.0.0", port), _Handler)
-        log(f"🔍 VIS_DEBUG → Dashboard: http://localhost:{port}  (浏览器打开;/video=MJPEG /state.json=状态)")
-        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-        server_thread.start()
-        stop.wait()
-        server.shutdown()
-    except Exception as e:
-        log(f"⚠ VIS_DEBUG 服务启动失败: {e}")
-
-
-def doa_sensor_loop(st: State, stop: threading.Event) -> None:
-    """DOA 纯传感器:10Hz 轮询 → 中值窗口 → 置信的视场外残差发布到 st.sound_resid。
-    机器人自己说话期间的读数不入窗(防自声/扬声器反射污染)。behavior_loop 消费,不动头。"""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    if _read_doa(opener) is None:
-        log("⚠ DOA 端点不可用,本次无声源转向(其余功能不受影响)")
-        return
-    log("👂 声源传感器就绪(DOA REST 10Hz)")
-    buf: "deque[tuple[float, float]]" = deque()    # 老:1.5s 窗 → sound_resid(SEEK/声源转向消费,不动)
-    buf2: "deque[tuple[float, float]]" = deque()   # 新:DOA_WIN_S 窗 → doa_resid_stable/confident(M1.5-b/门控)
-
-    def _med_iqr(samples):
-        a = sorted(samples)
-        n = len(a)
-        return a[n // 2], a[(3 * n) // 4] - a[n // 4]   # (中值, IQR)
-
-    while not stop.is_set():
-        time.sleep(1.0 / DOA_POLL_HZ)
-        r = _read_doa(opener)
-        now = time.monotonic()
-        with st.lock:
-            robot_speaking = now < st.playback_end_estimate + 0.4
-            by = st.body_yaw_deg
-        # M1.5-a.5:DOA 常开固化——说话时也采(AEC 已证拾到外部方向,不再自声门控屏蔽)。
-        # 只改"算不算",绝不改"转不转"(转向消费在 behavior 有 not speaking 守卫、SEEK 只唤醒消费)。
-        if r is not None and r[1]:
-            buf.append((now, r[0]))
-            buf2.append((now, r[0]))
-            if DOA_DEBUG:
-                log(f"🎧 raw={r[0]:+6.0f}° vad=1 speaking={int(robot_speaking)} body_yaw={by:+.0f}° (n={len(buf2)})")
-
-        # ── 老窗(SND_WIN_S)→ st.sound_resid(原样,消费方零影响)──
-        while buf and now - buf[0][0] > SND_WIN_S:
-            buf.popleft()
-        if len(buf) >= SND_MIN_SAMPLES:
-            med, spread = _med_iqr(a for _, a in buf)
-            with st.lock:
-                st.sound_resid = 90.0 - med
-                st.sound_at = now
-                st.sound_spread = spread
-
-        # ── 新长窗(DOA_WIN_S)→ 稳健方向 + 可信度(confident=稳不是对)──
-        while buf2 and now - buf2[0][0] > DOA_WIN_S:
-            buf2.popleft()
-        if len(buf2) >= DOA_MIN_SAMPLES:
-            med2, iqr2 = _med_iqr(a for _, a in buf2)
-            resid2 = 90.0 - med2
-            confident = iqr2 < GATE_SPREAD          # 镜像翻转双簇→IQR~90→False;可用区→低 IQR→True
-            with st.lock:
-                st.doa_resid_stable = resid2
-                st.doa_confident = confident
-                st.doa_at = now
-            if DOA_DEBUG:
-                log(f"🎧→ resid_stable={resid2:+.0f}° IQR={iqr2:.0f}° confident={confident} "
-                    f"speaking={int(robot_speaking)} body_yaw={by:+.0f}° n={len(buf2)}")
-        else:
-            with st.lock:
-                st.doa_confident = False             # 样本不够(含静默)→ 不可信
-
-
-def _fresh_sound(st: State) -> float | None:
-    """读取新鲜(<0.6s)且偏离够大(>25°)的声源残差;否则 None。"""
-    now = time.monotonic()
-    with st.lock:
-        if st.sound_resid is None or (now - st.sound_at) > 0.6:
-            return None
-        return st.sound_resid if abs(st.sound_resid) >= SND_RESID_MIN else None
+from voice.debug_server import vis_debug_server
 
 
 # ──────────── 状态机(②③④+逗它 的调度大脑;状态图见 ARCHITECTURE.md §3)────────────
@@ -2717,6 +1029,10 @@ def behavior_loop(st: State, snap_q: "queue.Queue", stop: threading.Event,
                     sr, sconf, sat = st.doa_resid_stable, st.doa_confident, st.doa_at
                     st.track_yaw = st.track_pitch = 0.0   # armed 居中,从 0 起转
             if woke:
+                if not st.vis_ready:
+                    log("🔎 唤醒但视觉子进程未就绪,等待…")
+                    approach(0.0, 0.0, 0.0)
+                    continue
                 fresh = sr is not None and (now - sat) < DOA_WAKE_FRESH_S
                 if fresh and sconf and sr is not None:
                     # 两阶段 SEEK:confident → 直转到 DOA 角度,到位后附近找脸
@@ -3105,9 +1421,6 @@ def head_control_loop(mini: ReachyMini, st: State, stop: threading.Event) -> Non
     next_joy = 0.0
     last_play_exit = -1e9
     ant_parked = True
-    # M3-a 呼吸状态(平滑切换)
-    br_freq = ARMED_BREATH_F
-    br_amp_cur = ARMED_BREATH_PITCH
     # M3-a cue 微变异(新 cue 触发时随机化)
     prev_cue = None
     prev_cue_t = 0.0
@@ -3117,7 +1430,6 @@ def head_control_loop(mini: ReachyMini, st: State, stop: threading.Event) -> Non
     expr_ant_cur = 0.0
     # 读一次 flags(运行时不变)
     _no_easing = st.no_easing
-    _no_breathe = st.no_breathe
     _no_variation = st.no_variation
     _no_expression = st.no_expression
     # Issue#3: pose change tracer
@@ -3144,15 +1456,6 @@ def head_control_loop(mini: ReachyMini, st: State, stop: threading.Event) -> Non
             prev_state = state
             time.sleep(dt)
             continue
-
-        # ── M3-a 全态呼吸(per-state freq/amp, τ=2s 平滑切换)──
-        if not _no_breathe:
-            _bp = BREATH_PARAMS.get(state, (0.22, 1.0))
-            br_freq += (_bp[0] - br_freq) * (dt / BREATH_BLEND_TAU)
-            br_amp_cur += (_bp[1] - br_amp_cur) * (dt / BREATH_BLEND_TAU)
-            breath = br_amp_cur * math.sin(2 * math.pi * br_freq * now)
-        else:
-            breath = 0.0
 
         # ── Cue 渲染:M3-a 缓动(easeOutBack 攻击 + easeInQuad 衰减)+ 微变异(±15%)──
         cue_pitch, cue_ant = 0.0, None
@@ -3212,11 +1515,12 @@ def head_control_loop(mini: ReachyMini, st: State, stop: threading.Event) -> Non
         else:
             expr_ant_cur = 0.0
 
-        # ── ARMED 早返回:呼吸 + cue ──
+        # ── ARMED 早返回:慢呼吸(仅 ARMED 有呼吸)+ cue ──
         if state == ST_ARMED:
+            br = ARMED_BREATH_PITCH * math.sin(2 * math.pi * ARMED_BREATH_F * now)
             ant = cue_ant if cue_ant is not None else list(INIT_ANTENNAS)
             try:
-                mini.set_target(head=head_pose(pitch_deg=tp + breath + cue_pitch, yaw_deg=ty),
+                mini.set_target(head=head_pose(pitch_deg=tp + br + cue_pitch, yaw_deg=ty),
                                 antennas=ant, body_yaw=math.radians(body))
             except Exception:
                 time.sleep(1.0)
@@ -3286,7 +1590,7 @@ def head_control_loop(mini: ReachyMini, st: State, stop: threading.Event) -> Non
                 _pose_log_t = now
         try:
             mini.set_target(
-                head=head_pose(pitch_deg=tp + sway_pitch + cue_pitch + breath + think_pitch_off,
+                head=head_pose(pitch_deg=tp + sway_pitch + cue_pitch + think_pitch_off,
                                yaw_deg=ty + sway_yaw,
                                roll_deg=think_roll),
                 antennas=antennas,
@@ -3294,55 +1598,6 @@ def head_control_loop(mini: ReachyMini, st: State, stop: threading.Event) -> Non
         except Exception:
             time.sleep(1.0)
         time.sleep(dt)
-
-
-# ───────────────────────── 播放线程:队列 → 扬声器 ─────────────────────────
-def player_loop(mini: ReachyMini, st: State, play_q: "queue.Queue", stop: threading.Event) -> None:
-    def current_gen() -> int:
-        with st.lock:
-            return st.play_gen
-
-    def push(chunk: np.ndarray) -> None:
-        try:
-            mini.media.push_audio_sample(chunk)
-        except Exception as e:
-            log(f"⚠ push_audio_sample 失败: {type(e).__name__}: {e}")
-            return
-        with st.lock:
-            base = max(st.playback_end_estimate, time.monotonic())
-            st.playback_end_estimate = base + len(chunk) / PLAY_SR
-
-    buffering = True
-    while not stop.is_set():
-        try:
-            gen, chunk = play_q.get(timeout=0.1)
-        except queue.Empty:
-            buffering = True
-            continue
-        if gen != current_gen():
-            continue
-        if buffering:
-            stash = [(gen, chunk)]
-            dur = len(chunk) / PLAY_SR
-            t_start = time.monotonic()
-            while dur < JITTER_S and time.monotonic() - t_start < JITTER_WALL_S:
-                try:
-                    g2, c2 = play_q.get(timeout=0.05)
-                except queue.Empty:
-                    continue
-                if g2 != current_gen():
-                    continue
-                stash.append((g2, c2))
-                dur += len(c2) / PLAY_SR
-            g_now = current_gen()
-            valid = [c for g, c in stash if g == g_now]
-            if not valid:
-                continue
-            for c in valid:
-                push(c)
-            buffering = False
-        else:
-            push(chunk)
 
 
 # ───────────────────────── 主流程 ─────────────────────────
@@ -3430,7 +1685,6 @@ def main() -> int:
     no_switch = "--no-switch" in _args                  # M1.5-b:关二次唤醒切换(对比/排错)
     no_sticky = "--no-sticky" in _args                  # M1.5-c:关粘滞选脸 = 每帧 argmax 最大脸(对比/排错)
     no_easing = "--no-easing" in _args                  # M3-a:关缓动曲线,回退 sin 包络
-    no_breathe = "--no-breathe" in _args                # M3-a:关全态呼吸
     no_variation = "--no-variation" in _args            # M3-a:关 cue 微变异
     no_expression = "--no-expression" in _args          # M3-b:关表情/思考反应
     no_memory = "--no-memory" in _args                  # M3-c:关记忆系统
@@ -3451,14 +1705,14 @@ def main() -> int:
 
     st = State()
     st.no_easing = no_easing
-    st.no_breathe = no_breathe
     st.no_variation = no_variation
     st.no_expression = no_expression
     st.no_memory = no_memory
 
-    global _id_recognizer, _memory_mgr
+    global _id_recognizer, _memory_mgr, _owner_mgr
+    _owner_mgr = OwnerManager()
     _id_recognizer = IdentityRecognizer()
-    _memory_mgr = MemoryManager()
+    _memory_mgr = MemoryManager(owner_mgr=_owner_mgr)
     log(f"🆔 身份识别就绪 (特征库 {len(_id_recognizer.db.persons)} 人)")
     play_q: "queue.Queue" = queue.Queue()
     motion_q: "queue.Queue" = queue.Queue()
@@ -3523,7 +1777,7 @@ def main() -> int:
                     active_instructions += _mem_sec
                     log(f"📝 已加载记忆({len(_mems)} 条记忆" + (", 有画像" if _profile else "") + ")")
             else:
-                active_tools = [t for t in TOOLS if t["name"] not in ("remember_fact", "clear_memory")]
+                active_tools = [t for t in TOOLS if t["name"] not in ("remember_fact", "clear_memory", "forget_fact")]
 
             callback = ChatCallback(st, play_q, motion_q, snap_q, mini)
 
@@ -3565,7 +1819,6 @@ def main() -> int:
                 return None
 
             def close_session(c):
-                global _current_turn, _pending_asr
                 try:
                     c.close()
                 except Exception:
@@ -3574,12 +1827,12 @@ def main() -> int:
                 with st.lock:
                     st.identity_injected = False
                 # 服务端错误导致断连时 response.done 不会到来，强制关闭当前轮次
-                if _current_turn is not None:
-                    _current_turn["end_ts"] = time.strftime("%H:%M:%S")
-                    _current_turn["end_mono"] = time.monotonic()
-                    _current_turn = None
+                if _st_mod._current_turn is not None:
+                    _st_mod._current_turn["end_ts"] = time.strftime("%H:%M:%S")
+                    _st_mod._current_turn["end_mono"] = time.monotonic()
+                    _st_mod._current_turn = None
                 # 清掉未消费的 ASR buffer，防止它污染下一个新会话的第一个 turn
-                _pending_asr = ""
+                _st_mod._pending_asr = ""
 
             conv = None
             kws_gate = None
@@ -3611,7 +1864,8 @@ def main() -> int:
             vis_frame_q = None
             _vis_enabled = os.path.exists(VIS_MODEL_PATH)
             if _vis_enabled:
-                log("视觉后端: mediapipe" + (" (sticky OFF)" if no_sticky else ""))
+                _fb = os.environ.get("FACE_BACKEND", "yunet").lower()
+                log(f"视觉后端: {_fb}" + (" (sticky OFF)" if no_sticky else ""))
                 if no_sticky:
                     os.environ["VISION_NO_STICKY"] = "1"
                 elif "VISION_NO_STICKY" in os.environ:
@@ -3621,6 +1875,7 @@ def main() -> int:
                 multiprocessing.Process(
                     target=_vision_worker_fn,
                     args=(VIS_MODEL_PATH, HAND_MODEL_PATH, vis_frame_q, vis_result_q),
+                    kwargs={"gesture_model": GESTURE_MODEL_PATH},
                     daemon=True,
                 ).start()
                 threading.Thread(target=frame_pump_loop, args=(mini, st, vis_frame_q, stop), daemon=True).start()
@@ -3747,6 +2002,25 @@ def main() -> int:
                             log(f"⚠ 唤醒招呼发送失败:{e}")
                     elif _do_greet and _busy:
                         log("👋 唤醒应答跳过(模型已在回应后续话,不双答)")
+                    # 延迟记忆注入:唤醒时身份识别可能还没出结果,识别到后补注入
+                    if not no_memory and conv is not None:
+                        with st.lock:
+                            _late_pid = st.current_person_id
+                            _late_pname = st.current_person_name
+                            _late_injected = st.identity_injected
+                        if _late_pid and not _late_injected and _memory_mgr is not None:
+                            _mem_prompt = _memory_mgr.get_prompt(_late_pid, person_name=_late_pname)
+                            if _mem_prompt:
+                                try:
+                                    conv.create_item({
+                                        "type": "message", "role": "system",
+                                        "content": [{"type": "input_text", "text": _mem_prompt}],
+                                    })
+                                    log(f"🧠 已注入记忆上下文 ({_late_pname or _late_pid[:12]})")
+                                except Exception as e:
+                                    log(f"⚠ 记忆注入失败:{e}")
+                            with st.lock:
+                                st.identity_injected = True
                     rms_acc.append(float(np.sqrt(np.mean(mono**2))))
                     # M1.5-a 方向门控:只挡"确信范围外"(fresh+confident+|resid|>GATE_DEG),其余一律放行;
                     # 范围外→发静音(服务端听不到→自动不送/不打断/不重置计时,不碰那些代码)。

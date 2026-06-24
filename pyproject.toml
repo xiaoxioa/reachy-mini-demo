@@ -1,0 +1,28 @@
+[project]
+name = "shadow-yunwu-claudecode-aibasicalgodevdept-20260529"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "reachy-mini",
+    "openai",
+    "dashscope",
+    "mediapipe<0.10.15; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "mediapipe; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "opencv-python",
+    "numpy",
+    "scipy",
+    "Pillow",
+    "pyttsx3",
+    "python-dotenv",
+    "sherpa-onnx",
+    "pytweening",
+    "onnxruntime<1.20; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "onnxruntime; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+]
+
+[tool.uv]
+override-dependencies = [
+    "jaxlib<0.5; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]

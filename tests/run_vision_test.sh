@@ -133,8 +133,8 @@ except Exception:
 " 2>/dev/null)
 ok "Python: $($PYTHON --version 2>&1)  后端: $BACKEND"
 
-FACE_MODEL="$PROJECT_ROOT/vision/models/face_landmarker.task"
-HAND_MODEL="$PROJECT_ROOT/vision/models/hand_landmarker.task"
+FACE_MODEL="$PROJECT_ROOT/models/face_landmarker.task"
+HAND_MODEL="$PROJECT_ROOT/models/hand_landmarker.task"
 [ -f "$FACE_MODEL" ] && ok "人脸模型: $(du -h "$FACE_MODEL" | cut -f1)" || warn "人脸模型缺失: $FACE_MODEL"
 [ -f "$HAND_MODEL" ] && ok "手部模型: $(du -h "$HAND_MODEL" | cut -f1)" || warn "手部模型缺失: $HAND_MODEL"
 echo ""

@@ -120,16 +120,29 @@ class FaceDB:
         os.replace(tmp, self.db_path)
 
     def match(self, embedding: np.ndarray) -> tuple[Optional[str], float]:
-        """匹配最相似的人。返回 (person_id, similarity) 或 (None, 0)。"""
+        """匹配最相似的人。返回 (person_id, similarity) 或 (None, 0)。
+
+        同时比较单 embedding 最佳匹配和质心匹配，取较大值，
+        防止大角度变化时单 embedding 匹配失败导致碎片化。
+        """
         best_id = None
         best_sim = -1.0
         emb = np.array(embedding, dtype=np.float32)
         for pid, info in self.persons.items():
-            for stored in info.get("embeddings", []):
-                sim = float(np.dot(emb, np.array(stored, dtype=np.float32)))
-                if sim > best_sim:
-                    best_sim = sim
-                    best_id = pid
+            stored = info.get("embeddings", [])
+            if not stored:
+                continue
+            sims = [float(np.dot(emb, np.array(s, dtype=np.float32))) for s in stored]
+            max_single = max(sims)
+            centroid = np.mean([np.array(s, dtype=np.float32) for s in stored], axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm > 0:
+                centroid = centroid / norm
+            centroid_sim = float(np.dot(emb, centroid))
+            person_sim = max(max_single, centroid_sim)
+            if person_sim > best_sim:
+                best_sim = person_sim
+                best_id = pid
         if best_sim >= COSINE_THRESHOLD:
             return best_id, best_sim
         return None, best_sim
@@ -149,17 +162,16 @@ class FaceDB:
         return pid
 
     def update_embedding(self, person_id: str, embedding: np.ndarray):
-        """追加新 embedding（不同角度），只收高质量的。"""
+        """追加新 embedding（不同角度），鼓励多样性。"""
         info = self.persons.get(person_id)
         if not info:
             return
         embs = info.get("embeddings", [])
         sims = [float(np.dot(embedding, np.array(s, dtype=np.float32))) for s in embs]
         max_sim = max(sims) if sims else 0.0
-        avg_sim = sum(sims) / len(sims) if sims else 0.0
         if max_sim > 0.85:
             return
-        if avg_sim < COSINE_THRESHOLD:
+        if max_sim < 0.20:
             return
         embs.append(embedding.tolist())
         if len(embs) > MAX_EMBEDDINGS_PER_PERSON:
@@ -167,7 +179,7 @@ class FaceDB:
         info["last_seen_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         self._save()
 
-    def set_name(self, person_id: str, name: str):
+    def set_name(self, person_id: str, name: Optional[str]):
         if person_id in self.persons:
             self.persons[person_id]["name"] = name
             self._save()
@@ -200,6 +212,80 @@ class FaceDB:
         self.persons = {}
         self._save()
 
+    def _cross_sim(self, pid_a: str, pid_b: str) -> float:
+        """两人之间的最大交叉相似度。"""
+        embs_a = self.persons.get(pid_a, {}).get("embeddings", [])
+        embs_b = self.persons.get(pid_b, {}).get("embeddings", [])
+        if not embs_a or not embs_b:
+            return 0.0
+        best = 0.0
+        for ea in embs_a:
+            a = np.array(ea, dtype=np.float32)
+            for eb in embs_b:
+                sim = float(np.dot(a, np.array(eb, dtype=np.float32)))
+                if sim > best:
+                    best = sim
+        return best
+
+    def merge_persons(self, keep_pid: str, drop_pid: str) -> str:
+        """合并两个条目: 保留 keep_pid, 吸收 drop_pid 的 embeddings。"""
+        keep = self.persons.get(keep_pid)
+        drop = self.persons.get(drop_pid)
+        if not keep or not drop:
+            return keep_pid
+        merged = list(keep["embeddings"])
+        for emb in drop["embeddings"]:
+            e = np.array(emb, dtype=np.float32)
+            dup = any(float(np.dot(e, np.array(m, dtype=np.float32))) > 0.90
+                      for m in merged)
+            if not dup:
+                merged.append(emb)
+        keep["embeddings"] = merged[-MAX_EMBEDDINGS_PER_PERSON:]
+        if not keep.get("name") and drop.get("name"):
+            keep["name"] = drop["name"]
+        if drop.get("created_at", "") < keep.get("created_at", ""):
+            keep["created_at"] = drop["created_at"]
+        keep["last_seen_at"] = max(
+            keep.get("last_seen_at", ""), drop.get("last_seen_at", ""))
+        del self.persons[drop_pid]
+        self._save()
+        return keep_pid
+
+    def auto_merge(self, threshold: float = 0.50) -> dict[str, str]:
+        """扫描所有人, 合并 max cross-sim > threshold 的对。
+
+        返回 {被删 pid: 保留 pid} 映射, 供调用方更新引用。
+        """
+        merged_map: dict[str, str] = {}
+        changed = True
+        while changed:
+            changed = False
+            pids = list(self.persons.keys())
+            for i, pa in enumerate(pids):
+                if pa not in self.persons:
+                    continue
+                for pb in pids[i + 1:]:
+                    if pb not in self.persons:
+                        continue
+                    a_named = bool(self.persons[pa].get("name"))
+                    b_named = bool(self.persons[pb].get("name"))
+                    if a_named and b_named:
+                        continue
+                    if self._cross_sim(pa, pb) >= threshold:
+                        a_n = len(self.persons[pa].get("embeddings", []))
+                        b_n = len(self.persons[pb].get("embeddings", []))
+                        if a_named or (not b_named and a_n >= b_n):
+                            keep, drop = pa, pb
+                        else:
+                            keep, drop = pb, pa
+                        self.merge_persons(keep, drop)
+                        merged_map[drop] = keep
+                        changed = True
+                        break
+                if changed:
+                    break
+        return merged_map
+
 
 class IdentityRecognizer:
     """组合 YuNet + ArcFace + FaceDB 的高层接口。"""
@@ -210,10 +296,15 @@ class IdentityRecognizer:
         self._last_id = None
         self._last_t = 0.0
         self._pending_new: dict[str, list[np.ndarray]] = {}
+        self._merged_map: dict[str, str] = {}
+        merged = self.db.auto_merge()
+        if merged:
+            self._merged_map.update(merged)
+            print(f"[identity] 启动合并: {len(merged)} 对重复人脸已合并")
 
     def _face_key(self, box: tuple[int, int, int, int]) -> str:
         cx, cy = box[0] + box[2] // 2, box[1] + box[3] // 2
-        return f"{cx // 40}_{cy // 40}"
+        return f"{cx // 80}_{cy // 80}"
 
     def recognize(self, rgb: np.ndarray,
                   face_box: tuple[int, int, int, int],

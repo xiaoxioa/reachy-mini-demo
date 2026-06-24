@@ -5,8 +5,9 @@
   1. 身份匹配后调 load_memory(person_id) 加载记忆
   2. 注入 Qwen session: conv.create_item(role="system", content=get_prompt(pid))
   3. Qwen function_call "remember_fact" → save_fact(pid, key, value)
-  4. Qwen function_call "clear_memory" → clear_all(pid, confirmed=True)
-  5. 会话结束/切人时自动持久化
+  4. Qwen function_call "forget_fact"   → forget_fact(pid, key)  # 模糊匹配删单条
+  5. Qwen function_call "clear_memory"  → clear_all(pid, confirmed=True)
+  6. 会话结束/切人时自动持久化
 
 用法(独立测试):
   python memory_manager.py --list                 # 列出所有人的记忆
@@ -59,17 +60,33 @@ QWEN_TOOLS = [
             "required": ["confirmed"],
         },
     },
+    {
+        "type": "function",
+        "name": "forget_fact",
+        "description": (
+            "忘掉关于用户的某一条具体信息。当用户说'忘掉我喜欢火锅''别记我的名字了''把那个删了'等时调用。"
+            "key 填要忘掉的信息类别关键词(如 name, hotpot, dog 等),支持模糊匹配。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "要忘掉的信息类别关键词"},
+            },
+            "required": ["key"],
+        },
+    },
 ]
 
 
 class MemoryManager:
     """管理每个人的记忆：会话内 dict + 磁盘 JSON 持久化。"""
 
-    def __init__(self, memories_dir: str = _MEMORIES_DIR):
+    def __init__(self, memories_dir: str = _MEMORIES_DIR, owner_mgr=None):
         self.memories_dir = memories_dir
         os.makedirs(self.memories_dir, exist_ok=True)
         self._session: dict[str, dict[str, str]] = {}
         self._dirty: set[str] = set()
+        self._owner = owner_mgr
 
     def _path(self, person_id: str) -> str:
         safe_id = person_id.replace("/", "_").replace("..", "_")
@@ -109,10 +126,13 @@ class MemoryManager:
             return f"已更新：{key} 从 '{old}' 改为 '{value}'"
         return f"已记住：{key} = '{value}'"
 
-    def clear_all(self, person_id: str, confirmed: bool = False) -> str:
-        """清除某人所有记忆。需要 confirmed=True。"""
+    def clear_all(self, person_id: str, confirmed: bool = False,
+                  actor_pid: str = None) -> str:
+        """清除某人所有记忆。需要 confirmed=True。actor_pid 用于权限校验。"""
         if not confirmed:
             return "请先向用户确认是否要清除所有记忆。"
+        if actor_pid and self._owner and not self._owner.can_delete_memory(actor_pid, person_id):
+            return "只有主人才能删除其他人的记忆哦。"
         data = self.load_memory(person_id)
         now = time.strftime("%Y-%m-%dT%H:%M:%S")
         old_facts = dict(data["facts"])
@@ -125,6 +145,40 @@ class MemoryManager:
         self._dirty.add(person_id)
         self._persist(person_id)
         return f"已清除所有记忆（共 {len(old_facts)} 条）。"
+
+    def forget_fact(self, person_id: str, key: str,
+                    actor_pid: str = None) -> str:
+        """删除某人的一条 fact。key 模糊匹配(包含即命中)。actor_pid 用于权限校验。"""
+        if actor_pid and self._owner and not self._owner.can_delete_memory(actor_pid, person_id):
+            return "只有主人才能删除其他人的记忆哦。"
+        data = self.load_memory(person_id)
+        now = time.strftime("%Y-%m-%dT%H:%M:%S")
+        matched = [k for k in data["facts"] if key.lower() in k.lower()]
+        if not matched:
+            available = ", ".join(data["facts"].keys()) if data["facts"] else "无"
+            return f"没有找到包含「{key}」的记忆。当前记忆: {available}"
+        removed = {}
+        for k in matched:
+            removed[k] = data["facts"].pop(k)
+        data["history"].append({
+            "action": "forget",
+            "removed": removed,
+            "at": now,
+        })
+        self._dirty.add(person_id)
+        self._persist(person_id)
+        return f"已忘掉 {len(removed)} 条: {', '.join(f'{k}={v}' for k,v in removed.items())}"
+
+    def merge_memories(self, keep_pid: str, drop_pid: str) -> None:
+        """将 drop_pid 的 facts 合并到 keep_pid (keep 优先, 不覆盖已有 key)。"""
+        drop_facts = self.get_facts(drop_pid)
+        if not drop_facts:
+            return
+        keep_facts = self.get_facts(keep_pid)
+        for k, v in drop_facts.items():
+            if k not in keep_facts:
+                self.save_fact(keep_pid, k, v)
+        self.clear_all(drop_pid, confirmed=True)
 
     def get_facts(self, person_id: str) -> dict[str, str]:
         """获取某人当前所有 facts。"""
@@ -196,7 +250,8 @@ class MemoryManager:
                 continue
         return result
 
-    def handle_tool_call(self, person_id: str, tool_name: str, args: dict) -> str:
+    def handle_tool_call(self, person_id: str, tool_name: str, args: dict,
+                         actor_pid: str = None) -> str:
         """处理 Qwen function call。返回 function_call_output 内容。"""
         if tool_name == "remember_fact":
             key = args.get("key", "")
@@ -206,7 +261,12 @@ class MemoryManager:
             return self.save_fact(person_id, key, value)
         elif tool_name == "clear_memory":
             confirmed = args.get("confirmed", False)
-            return self.clear_all(person_id, confirmed)
+            return self.clear_all(person_id, confirmed, actor_pid=actor_pid)
+        elif tool_name == "forget_fact":
+            key = args.get("key", "")
+            if not key:
+                return "缺少 key 参数。"
+            return self.forget_fact(person_id, key, actor_pid=actor_pid)
         return f"未知的记忆工具: {tool_name}"
 
 

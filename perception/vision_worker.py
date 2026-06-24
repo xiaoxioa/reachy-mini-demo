@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 """视觉子进程(TRACK-FIX + POINT-02 + PLAY-01):Face(每帧)+ Hand(自适应提频)。
 
 独立进程 = 独立 GIL:六线程融合后视觉循环曾被饿到 41→19fps,挪进程后真并行。
@@ -62,60 +63,74 @@ def pick_main_face(result):
     return best
 
 
+def pick_main_face_yunet(faces, W: int, H: int):
+    """YuNet 版:从 detect() 结果选最大脸,返回 (u, v, h_ratio) 或 None。"""
+    if faces is None or len(faces) == 0:
+        return None
+    best = None
+    best_area = -1.0
+    for f in faces:
+        area = f[2] * f[3]
+        if area > best_area:
+            best_area = area
+            best = f
+    if best is None:
+        return None
+    x, y, w, h = best[0], best[1], best[2], best[3]
+    return ((x + w / 2) / W, (y + h / 2) / H, h / H)
+
+
 class FaceSelector:
-    """M1.5-c 跨帧粘滞选脸:锁住一张脸就跟着,除非它消失或另一张持续明显更大。"""
+    """M1.5-c 跨帧粘滞选脸:锁住一张脸就跟着,除非它消失或另一张持续明显更大。
+    支持 YuNet 格式: faces 是 Nx15 数组, 每行 [x,y,w,h, kp*10, conf]。"""
 
     def __init__(self, sticky: bool = True):
         self._sticky = sticky
-        self._prev_u = None       # 上帧选中脸的中心 u
-        self._prev_v = None       # 上帧选中脸的中心 v
-        self._rival_count = 0     # 另一张脸"明显更大"连续帧计数
-        self.selected_landmarks = None  # 选中脸的原始 MediaPipe landmarks
+        self._prev_u = None
+        self._prev_v = None
+        self._rival_count = 0
+        self.selected_face = None  # 选中脸的原始 YuNet 行
 
     def reset(self):
-        """清除粘滞状态(切换对话对象时调用)。"""
         self._prev_u = self._prev_v = None
         self._rival_count = 0
-        self.selected_landmarks = None
+        self.selected_face = None
 
-    def select(self, result) -> tuple | None:
-        """从 MediaPipe 结果选脸。返回 (u, v, h) 或 None。选中脸的 landmarks 存入 self.selected_landmarks。"""
-        if not result.face_landmarks:
+    def select_yunet(self, faces, W: int, H: int) -> tuple | None:
+        """从 YuNet detect() 结果选脸。返回 (u, v, h_ratio) 或 None。"""
+        if faces is None or len(faces) == 0:
             self._prev_u = self._prev_v = None
             self._rival_count = 0
-            self.selected_landmarks = None
+            self.selected_face = None
             return None
 
-        faces = []
-        for idx, lms in enumerate(result.face_landmarks):
-            xs = [p.x for p in lms]
-            ys = [p.y for p in lms]
-            h = max(ys) - min(ys)
-            u = (min(xs) + max(xs)) / 2.0
-            v = (min(ys) + max(ys)) / 2.0
-            faces.append((u, v, h, idx))
+        parsed = []
+        for idx, f in enumerate(faces):
+            x, y, w, h = f[0], f[1], f[2], f[3]
+            u = (x + w / 2) / W
+            v = (y + h / 2) / H
+            h_ratio = h / H
+            parsed.append((u, v, h_ratio, idx))
 
-        def _pick(f):
-            self._prev_u, self._prev_v = f[0], f[1]
+        def _pick(p):
+            self._prev_u, self._prev_v = p[0], p[1]
             self._rival_count = 0
-            self.selected_landmarks = result.face_landmarks[f[3]]
-            return (f[0], f[1], f[2])
+            self.selected_face = faces[p[3]]
+            return (float(p[0]), float(p[1]), float(p[2]))
 
-        if not self._sticky or len(faces) == 1 or self._prev_u is None:
-            best = max(faces, key=lambda f: f[2])
+        if not self._sticky or len(parsed) == 1 or self._prev_u is None:
+            best = max(parsed, key=lambda f: f[2])
             return _pick(best)
 
-        # 多脸 + 有前帧 → 找距离上帧最近的(粘住)
         def _dist(f):
             return math.hypot(f[0] - self._prev_u, f[1] - self._prev_v)
 
-        matched = min(faces, key=_dist)
+        matched = min(parsed, key=_dist)
         if _dist(matched) > STICKY_MATCH_DIST:
-            best = max(faces, key=lambda f: f[2])
+            best = max(parsed, key=lambda f: f[2])
             return _pick(best)
 
-        # 检查是否有另一张脸持续明显更大(该切换了)
-        biggest = max(faces, key=lambda f: f[2])
+        biggest = max(parsed, key=lambda f: f[2])
         if biggest is not matched and biggest[2] > matched[2] * STICKY_SWITCH_RATIO:
             self._rival_count += 1
             if self._rival_count >= STICKY_SWITCH_FRAMES:
@@ -124,8 +139,8 @@ class FaceSelector:
             self._rival_count = 0
 
         self._prev_u, self._prev_v = matched[0], matched[1]
-        self.selected_landmarks = result.face_landmarks[matched[3]]
-        return (matched[0], matched[1], matched[2])
+        self.selected_face = faces[matched[3]]
+        return (float(matched[0]), float(matched[1]), float(matched[2]))
 
 
 def index_dir(lms):
@@ -192,38 +207,110 @@ def _classify_gesture(lms):
     return fingers, gesture
 
 
-def vision_worker(face_model: str, hand_model: str, frame_q, result_q) -> None:
-    """子进程入口:Face 每帧 + Hand 降频检测 frame_q 里的最新帧。"""
-    import mediapipe as mp
-    from mediapipe.tasks import python as mp_python
-    from mediapipe.tasks.python import vision as mp_vision
+YUNET_MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "models", "face_detection_yunet_2023mar.onnx")
+YUNET_SCORE_THR = 0.5
+YUNET_NMS_THR = 0.3
+YUNET_TOP_K = 10
 
+
+_MODEL_GESTURE_MAP = {
+    "Closed_Fist": "fist",
+    "Open_Palm": "five",
+    "Pointing_Up": "point",
+    "Victory": "two",
+    "Thumb_Up": "thumbup",
+    "Thumb_Down": "thumbdown",
+    "ILoveYou": "ily",
+}
+
+_GESTURE_FINGER_MAP = {
+    "fist": 0, "point": 1, "two": 2, "five": 5,
+    "thumbup": 1, "thumbdown": 1, "ily": 3,
+}
+
+
+def vision_worker(face_model: str, hand_model: str, frame_q, result_q,
+                   gesture_model: str = None) -> None:
+    """子进程入口:Face(每帧) + Hand(自适应提频)。
+
+    人脸后端通过环境变量 FACE_BACKEND 切换:
+      yunet (默认) — OpenCV YuNet, 零额外依赖, 全角度高检出率
+      mediapipe    — MediaPipe FaceLandmarker VIDEO 模式(含 blendshape 表情)
+
+    手势识别:
+      gesture_model 存在时用 GestureRecognizer(模型优先 + 规则 fallback)
+      否则用 HandLandmarker + 纯规则 _classify_gesture
+    """
+    import cv2
+
+    face_backend = os.environ.get("FACE_BACKEND", "yunet").lower()
     no_sticky = os.environ.get("VISION_NO_STICKY", "") == "1"
     face_sel = FaceSelector(sticky=not no_sticky)
 
-    face_lm = mp_vision.FaceLandmarker.create_from_options(
-        mp_vision.FaceLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=face_model),
-            running_mode=mp_vision.RunningMode.VIDEO, num_faces=2,
-            output_face_blendshapes=True))
+    # ── 人脸后端初始化 ──
+    use_yunet = (face_backend != "mediapipe")
+    yunet = None
+    face_lm = None
+    yunet_size = None  # (W, H) 缓存,尺寸变化时重建
+
+    if use_yunet:
+        print(f"[vision_worker] 人脸后端: YuNet ({YUNET_MODEL})", flush=True)
+    else:
+        import mediapipe as mp
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision as mp_vision
+        face_lm = mp_vision.FaceLandmarker.create_from_options(
+            mp_vision.FaceLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=face_model),
+                running_mode=mp_vision.RunningMode.VIDEO, num_faces=2,
+                min_face_detection_confidence=0.3,
+                min_face_presence_confidence=0.3,
+                min_tracking_confidence=0.3,
+                output_face_blendshapes=True))
+        print(f"[vision_worker] 人脸后端: MediaPipe ({face_model})", flush=True)
+
+    # ── 手部初始化(始终用 MediaPipe)──
     hand_lm = None
+    gesture_rec = None
+    use_gesture_rec = False
     try:
-        hand_lm = mp_vision.HandLandmarker.create_from_options(
-            mp_vision.HandLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=hand_model),
-                running_mode=mp_vision.RunningMode.VIDEO, num_hands=1,
-                min_hand_detection_confidence=0.7,   # 提高捕获门槛：Mac 背景误检率高，0.5 太宽松
-                min_hand_presence_confidence=0.5,    # 跟踪期适度放宽：运动模糊/快手不丢锁
-                min_tracking_confidence=0.4))        # 跟踪置信度同步收紧
+        if use_yunet:
+            import mediapipe as mp
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision as mp_vision
+        if gesture_model and os.path.exists(gesture_model):
+            gesture_rec = mp_vision.GestureRecognizer.create_from_options(
+                mp_vision.GestureRecognizerOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=gesture_model),
+                    running_mode=mp_vision.RunningMode.VIDEO, num_hands=1,
+                    min_hand_detection_confidence=0.7,
+                    min_hand_presence_confidence=0.5,
+                    min_tracking_confidence=0.4))
+            use_gesture_rec = True
+            print(f"[vision_worker] 手势后端: GestureRecognizer ({gesture_model})", flush=True)
+        else:
+            hand_lm = mp_vision.HandLandmarker.create_from_options(
+                mp_vision.HandLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=hand_model),
+                    running_mode=mp_vision.RunningMode.VIDEO, num_hands=1,
+                    min_hand_detection_confidence=0.7,
+                    min_hand_presence_confidence=0.5,
+                    min_tracking_confidence=0.4))
+            print(f"[vision_worker] 手势后端: HandLandmarker + 规则 ({hand_model})", flush=True)
     except Exception as _e:
-        print(f"[vision_worker] HandLandmarker 加载失败: {_e}", flush=True)
-        hand_lm = None  # 手模型缺失也不影响人脸跟随
+        print(f"[vision_worker] 手部/手势模型加载失败: {_e}", flush=True)
+        hand_lm = None
+        gesture_rec = None
+        use_gesture_rec = False
+
     result_q.put({"kind": "ready"})
 
     last_face_ts = -1
     last_hand_ts = -1
     n = 0
     hand_boost_until = -1.0
+
     while True:
         item = frame_q.get()
         if item is None:
@@ -233,67 +320,129 @@ def vision_worker(face_model: str, hand_model: str, frame_q, result_q) -> None:
             continue
         t_grab, rgb = item
         n += 1
+        H, W = rgb.shape[:2]
         out = {"kind": "det", "t": t_grab, "face": None, "n_faces": 0, "face_ms": 0.0,
                "face_box": None, "face_kps": None, "hand": None}
         try:
-            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            H, W = rgb.shape[:2]
+            # ── 人脸检测 ──
             t0 = time.monotonic()
-            last_face_ts = max(last_face_ts + 1, int(t_grab * 1000))
-            fres = face_lm.detect_for_video(mp_img, last_face_ts)
-            out["face_ms"] = (time.monotonic() - t0) * 1000.0
-            out["face"] = face_sel.select(fres)
-            out["n_faces"] = len(fres.face_landmarks) if fres.face_landmarks else 0
-            # M3-b 表情:从选中脸的 blendshapes 提取微笑/皱眉
-            if fres.face_blendshapes and out["face"] is not None:
-                _bs = fres.face_blendshapes[0]
-                _smile = _frown = 0.0
-                for cat in _bs:
-                    if cat.category_name == "mouthSmileLeft" or cat.category_name == "mouthSmileRight":
-                        _smile += cat.score * 0.5
-                    elif cat.category_name == "mouthFrownLeft" or cat.category_name == "mouthFrownRight":
-                        _frown += cat.score * 0.5
-                out["smile"] = _smile
-                out["frown"] = _frown
+            if use_yunet:
+                if yunet is None or yunet_size != (W, H):
+                    yunet = cv2.FaceDetectorYN.create(
+                        YUNET_MODEL, "", (W, H), YUNET_SCORE_THR, YUNET_NMS_THR, YUNET_TOP_K)
+                    yunet_size = (W, H)
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                _, faces_raw = yunet.detect(bgr)
+                out["face_ms"] = (time.monotonic() - t0) * 1000.0
+                out["face"] = face_sel.select_yunet(faces_raw, W, H)
+                out["n_faces"] = len(faces_raw) if faces_raw is not None else 0
+                if out["face"] is not None and face_sel.selected_face is not None:
+                    f = face_sel.selected_face
+                    out["face_box"] = (int(f[0]), int(f[1]), int(f[2]), int(f[3]))
+                    out["face_kps"] = [(float(f[4 + i * 2]), float(f[5 + i * 2]))
+                                       for i in range(5)]
+            else:
+                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                last_face_ts = max(last_face_ts + 1, int(t_grab * 1000))
+                fres = face_lm.detect_for_video(mp_img, last_face_ts)
+                out["face_ms"] = (time.monotonic() - t0) * 1000.0
+                out["face"] = face_sel.select_yunet(None, W, H)  # placeholder
+                # MediaPipe 路径:用旧 select 逻辑
+                if fres.face_landmarks:
+                    mp_faces = []
+                    for lms in fres.face_landmarks:
+                        xs = [p.x for p in lms]
+                        ys = [p.y for p in lms]
+                        fh = max(ys) - min(ys)
+                        fu = (min(xs) + max(xs)) / 2.0
+                        fv = (min(ys) + max(ys)) / 2.0
+                        mp_faces.append((fu, fv, fh))
+                    best = max(mp_faces, key=lambda f: f[2])
+                    out["face"] = best
+                    out["n_faces"] = len(fres.face_landmarks)
+                else:
+                    out["face"] = None
+                    out["n_faces"] = 0
+                if fres.face_blendshapes and out["face"] is not None:
+                    _bs = fres.face_blendshapes[0]
+                    _smile = _frown = 0.0
+                    for cat in _bs:
+                        if cat.category_name == "mouthSmileLeft" or cat.category_name == "mouthSmileRight":
+                            _smile += cat.score * 0.5
+                        elif cat.category_name == "mouthFrownLeft" or cat.category_name == "mouthFrownRight":
+                            _frown += cat.score * 0.5
+                    out["smile"] = _smile
+                    out["frown"] = _frown
+                if out["face"] is not None and fres.face_landmarks:
+                    lms = fres.face_landmarks[0]
+                    pxs = [p.x * W for p in lms]
+                    pys = [p.y * H for p in lms]
+                    bx, by = min(pxs), min(pys)
+                    bw, bh = max(pxs) - bx, max(pys) - by
+                    out["face_box"] = (int(bx), int(by), int(bw), int(bh))
+                    def _eye_center(i1, i2):
+                        return ((lms[i1].x + lms[i2].x) * 0.5 * W,
+                                (lms[i1].y + lms[i2].y) * 0.5 * H)
+                    out["face_kps"] = [
+                        _eye_center(*_MP_LEFT_EYE),
+                        _eye_center(*_MP_RIGHT_EYE),
+                        (lms[_MP_NOSE].x * W, lms[_MP_NOSE].y * H),
+                        (lms[_MP_MOUTH_LEFT].x * W, lms[_MP_MOUTH_LEFT].y * H),
+                        (lms[_MP_MOUTH_RIGHT].x * W, lms[_MP_MOUTH_RIGHT].y * H),
+                    ]
 
-            if out["face"] is not None and face_sel.selected_landmarks is not None:
-                lms = face_sel.selected_landmarks
-                pxs = [p.x * W for p in lms]
-                pys = [p.y * H for p in lms]
-                bx, by = min(pxs), min(pys)
-                bw, bh = max(pxs) - bx, max(pys) - by
-                out["face_box"] = (int(bx), int(by), int(bw), int(bh))
-                def _eye_center(i1, i2):
-                    return ((lms[i1].x + lms[i2].x) * 0.5 * W,
-                            (lms[i1].y + lms[i2].y) * 0.5 * H)
-                out["face_kps"] = [
-                    _eye_center(*_MP_LEFT_EYE),
-                    _eye_center(*_MP_RIGHT_EYE),
-                    (lms[_MP_NOSE].x * W, lms[_MP_NOSE].y * H),
-                    (lms[_MP_MOUTH_LEFT].x * W, lms[_MP_MOUTH_LEFT].y * H),
-                    (lms[_MP_MOUTH_RIGHT].x * W, lms[_MP_MOUTH_RIGHT].y * H),
-                ]
-
-            if hand_lm is not None and (n % HAND_EVERY == 0 or t_grab <= hand_boost_until):
-                # 手部检测要求时间戳严格 > 上次,且与 face 流不冲突 → 用独立递增计数
-                last_hand_ts = max(last_hand_ts + 1, last_face_ts + 1)
-                hres = hand_lm.detect_for_video(mp_img, last_hand_ts)
-                last_face_ts = last_hand_ts  # 两个检测器共用单调时钟,继续递增
-                if hres.hand_landmarks:
-                    lms0 = hres.hand_landmarks[0]
+            # ── 手部检测(MediaPipe,降频)──
+            _hand_ready = (hand_lm is not None or use_gesture_rec)
+            if _hand_ready and (n % HAND_EVERY == 0 or t_grab <= hand_boost_until):
+                mp_img_h = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                last_hand_ts = max(last_hand_ts + 1, int(t_grab * 1000) + 1)
+                if not use_yunet:
+                    last_hand_ts = max(last_hand_ts, last_face_ts + 1)
+                _hand_landmarks = None
+                _handedness = None
+                _model_gesture = None
+                _model_gesture_score = 0.0
+                if use_gesture_rec:
+                    gres = gesture_rec.recognize_for_video(mp_img_h, last_hand_ts)
+                    if gres.hand_landmarks:
+                        _hand_landmarks = gres.hand_landmarks
+                        _handedness = gres.handedness
+                        if gres.gestures and gres.gestures[0]:
+                            _model_gesture = gres.gestures[0][0].category_name
+                            _model_gesture_score = gres.gestures[0][0].score
+                else:
+                    hres = hand_lm.detect_for_video(mp_img_h, last_hand_ts)
+                    if hres.hand_landmarks:
+                        _hand_landmarks = hres.hand_landmarks
+                        _handedness = hres.handedness
+                if not use_yunet:
+                    last_face_ts = last_hand_ts
+                if _hand_landmarks:
+                    lms0 = _hand_landmarks[0]
                     angle, extended, tip = index_dir(lms0)
-                    fingers, gesture = _classify_gesture(lms0)
+                    mapped = _MODEL_GESTURE_MAP.get(_model_gesture or "")
+                    if mapped and _model_gesture_score >= 0.6:
+                        gesture = mapped
+                        fingers = _GESTURE_FINGER_MAP.get(gesture, -1)
+                        if fingers < 0:
+                            fingers, _ = _classify_gesture(lms0)
+                    else:
+                        fingers, gesture = _classify_gesture(lms0)
                     xs = [p.x for p in lms0]
                     ys = [p.y for p in lms0]
                     size = max(max(xs) - min(xs), max(ys) - min(ys))
-                    score = hres.handedness[0][0].score if hres.handedness else 1.0
-                    out["hand"] = {"angle": angle, "extended": extended, "tip": tip,
-                                   "u": (min(xs) + max(xs)) / 2.0,
-                                   "v": (min(ys) + max(ys)) / 2.0,
-                                   "size": size, "score": score,
-                                   "fingers": fingers, "gesture": gesture}
+                    score = _handedness[0][0].score if _handedness else 1.0
+                    hand_out = {"angle": angle, "extended": extended, "tip": tip,
+                                "u": (min(xs) + max(xs)) / 2.0,
+                                "v": (min(ys) + max(ys)) / 2.0,
+                                "size": size, "score": score,
+                                "fingers": fingers, "gesture": gesture}
+                    if _model_gesture:
+                        hand_out["gesture_model"] = _model_gesture
+                        hand_out["gesture_model_score"] = _model_gesture_score
+                    out["hand"] = hand_out
                     if score >= HAND_NEAR_SCORE and size >= HAND_NEAR_SIZE:
-                        hand_boost_until = t_grab + HAND_BOOST_S  # 近手 → 提频跟手
+                        hand_boost_until = t_grab + HAND_BOOST_S
             try:
                 result_q.put_nowait(out)
             except Exception:

@@ -30,8 +30,40 @@ DECIMATE = 3
 
 # (文件名, 提示语, expect)  ——  期望标注，供测试断言
 PLAN = [
+    # ── 基础人脸 ──
     ("face_front.jpg", "正脸对准摄像头（不要露手）",
      {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    # ── 距离变化 ──
+    ("face_close.jpg", "正脸靠近摄像头约 30cm（近距离）",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    ("face_mid.jpg", "正脸距摄像头约 60-80cm（正常对话距离）",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    ("face_far.jpg", "正脸距摄像头约 1.5-2m（远距离）",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    ("face_very_far.jpg", "正脸距摄像头约 2.5-3m（非常远）",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    # ── 角度变化（对话距离 60-80cm）──
+    ("face_yaw_l30.jpg", "脸向左偏约 30°（侧脸，对话距离）",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    ("face_yaw_r30.jpg", "脸向右偏约 30°（侧脸，对话距离）",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    ("face_yaw_l60.jpg", "脸向左偏约 60°（大角度侧脸，对话距离）",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    ("face_yaw_r60.jpg", "脸向右偏约 60°（大角度侧脸，对话距离）",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    ("face_pitch_up.jpg", "抬头约 30°（对话距离）",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    ("face_pitch_down.jpg", "低头约 30°（对话距离）",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    # ── 远距离 + 角度 ──
+    ("face_far_yaw_l30.jpg", "远距离 1.5m + 脸向左偏约 30°",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    ("face_far_yaw_r30.jpg", "远距离 1.5m + 脸向右偏约 30°",
+     {"face": True, "n_faces": 1, "hand": False, "gesture": None}),
+    # ── 多人 ──
+    ("face_two.jpg", "两人正脸同时对准摄像头（对话距离）",
+     {"face": True, "n_faces": 2, "hand": False, "gesture": None}),
+    # ── 手势（保留原有）──
     ("hand_fist.jpg", "握拳（fist）对准摄像头，靠近一些",
      {"face": True, "n_faces": 1, "hand": True, "gesture": "fist"}),
     ("hand_point.jpg", "只伸食指指向镜头（point）",
@@ -46,6 +78,7 @@ PLAN = [
      {"face": True, "n_faces": 1, "hand": True, "gesture": "five"}),
     ("hand_ok.jpg", "比 OK 手势（拇指+食指捏圈，其余三指伸直）",
      {"face": True, "n_faces": 1, "hand": True, "gesture": "ok"}),
+    # ── 负样本 ──
     ("no_target.jpg", "把镜头对准空白墙面/桌面（无脸无手）",
      {"face": False, "n_faces": 0, "hand": False, "gesture": None}),
 ]
