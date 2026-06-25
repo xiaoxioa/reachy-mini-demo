@@ -15,8 +15,13 @@
 
 ## Key Learnings
 
-- **Project:** shadow-yunwu-claudecode-aibasicalgodevdept-20260529
-- **Description:** 把一台 [Reachy Mini Lite](https://www.pollen-robotics.com/reachy-mini/)(USB 版)变成一个
+- **Project:** Reachy Mini Lite 语音交互机器人(USB 版)，Qwen3.5-Omni-Realtime 驱动
+- **运行环境:** macOS Intel + Python 3.12 + dashscope SDK
+- **视觉后端:** YuNet 默认(100%检出率), MediaPipe 可选(--face-mp), ArcFace 身份识别
+- **语音协议:** Qwen-Omni-Realtime WebSocket, update_session 做记忆注入(整体替换), 非 create_item(只增不删)
+- **状态机:** 9 态 FSM, TRACKING 态是核心对话状态, 方向门控只在此状态生效
+- **记忆存储:** per-person JSON facts (`data/memories/<pid>.json`), 对话摘要(conversation_summaries)
+- **清华镜像:** UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/ 所有 pip/uv 安装必用
 
 ## Do-Not-Repeat
 
@@ -32,6 +37,8 @@
 
 - [2026-06-25] **门控逻辑用白名单不用黑名单**: 只在 TRACKING 时关门(有人脸在面前对话)，其他状态一律放行。黑名单逐个豁免状态容易漏，且新状态默认被关门导致静音断连。
 - [2026-06-25] **d01 重构要领域驱动**: 移动代码时按领域归属(语音/记忆/感知)分配模块，不按"从哪里提取"机械分配。ChatCallback + 闭包 → 完整对话协议层(realtime.py)，不是"callback.py"。
+- [2026-06-25] **多线程 flag 消费顺序**: 清除 flag 必须在写入后续 state 之后(同一锁或之后的锁内)，否则其他线程在 flag=False + state=旧值 窗口误判。不要用超时阈值修补竞态——调整操作顺序消除窗口。
+- [2026-06-25] **conv=None 时 KWS 唤醒不能丢弃**: audio loop 在非 ARMED 状态 conv=None 时必须处理 KWS 命中(重连 WS)，否则 WS 意外断连后永远唤不醒。
 
 ## Decision Log
 

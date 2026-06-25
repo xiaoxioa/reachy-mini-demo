@@ -994,7 +994,7 @@ function openModal(e){
       for(const e of filtered){
         const c=e.role==='user'?'#60a5fa':'#34d399';
         const icon=e.role==='user'?'🎤':'🔊';
-        const who=e.name||e.pid||'';
+        const who=e.role==='user'?(e.name||e.pid||''):'小艺';
         const tag=who?'<span style="color:#9ca3af;font-size:9px">['+esc(who)+']</span> ':'';
         html+='<div style="color:'+c+';padding-left:8px;margin-top:2px"><span style="color:#6b7280;font-size:9px">'+esc(e.ts)+'</span> '+icon+' '+tag+esc(e.text.slice(0,150))+'</div>';
       }

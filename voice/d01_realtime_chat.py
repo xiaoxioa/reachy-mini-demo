@@ -751,6 +751,7 @@ def behavior_loop(st: State, snap_q: "queue.Queue", stop: threading.Event,
     pt_yaw_goal = pt_body_goal = pt_pitch_goal = 0.0  # POINTING 目标
     pt_phase = "turn"                                  # POINTING 子阶段
     pt_settle_t = pt_hold_t = 0.0
+    _vis_wait_logged = False
 
     def set_state(s: str, seed_interact: bool = False) -> None:
         nonlocal phase_t
@@ -823,16 +824,19 @@ def behavior_loop(st: State, snap_q: "queue.Queue", stop: threading.Event,
         if state == ST_ARMED:
             with st.lock:
                 woke = st.wake_ok
+                # 注意: 不在这里清 wake_ok — 等 set_state(ENGAGING) 后再清,
+                # 避免 audio loop 在 wake_ok=False + state=ARMED 窗口误关 WS。
                 if woke:
-                    st.wake_ok = False
-                    st.wake_doa = None
                     sr, sconf, sat = st.doa_resid_stable, st.doa_confident, st.doa_at
                     st.track_yaw = st.track_pitch = 0.0   # armed 居中,从 0 起转
             if woke:
                 if not st.vis_ready:
-                    log("🔎 唤醒但视觉子进程未就绪,等待…")
+                    if not _vis_wait_logged:
+                        log("🔎 唤醒但视觉子进程未就绪,等待…")
+                        _vis_wait_logged = True
                     approach(0.0, 0.0, 0.0)
                     continue
+                _vis_wait_logged = False
                 fresh = sr is not None and (now - sat) < DOA_WAKE_FRESH_S
                 if fresh and sconf and sr is not None:
                     # 两阶段 SEEK:confident → 直转到 DOA 角度,到位后附近找脸
@@ -852,6 +856,9 @@ def behavior_loop(st: State, snap_q: "queue.Queue", stop: threading.Event,
                 log(f"🔎 唤醒 → SEEK 寻人({hint})")
                 _record_vis_event("vis.seek_start", f"🔎 SEEK 寻人: {hint}", {"hint": hint})
                 set_state(ST_ENGAGING, seed_interact=True)
+                with st.lock:
+                    st.wake_ok = False
+                    st.wake_doa = None
             else:
                 approach(0.0, 0.0, 0.0)                 # 缓慢保持回正(头控渲染慢呼吸)
             continue
@@ -1595,7 +1602,7 @@ def main() -> int:
                         state = st.state
                         woke_pending = st.wake_ok
                     if state == ST_ARMED:
-                        if conv is not None and not woke_pending:     # engaged→armed:拆 WS(回零连接零计费)
+                        if conv is not None and not woke_pending:
                             dialog.close_session()
                             conv = None
                             log("🌙 已回待命,WS 断开(零连接零计费)")
@@ -1620,7 +1627,17 @@ def main() -> int:
                         continue                                       # armed:绝不发上行
                     # engaged:扇出上行给 Qwen
                     if conv is None:
-                        time.sleep(0.01)
+                        # WS 已死但 behavior 还停在 ENGAGING/TRACKING:
+                        # KWS 命中时直接重连,否则等 behavior 超时回 ARMED
+                        if wake:
+                            log("🔔 WS 已断但仍在对话态,收到唤醒词 → 重连…")
+                            conv = dialog.open_session()
+                            if conv is None:
+                                log("❌ 重连失败,等 behavior 超时回待命")
+                            else:
+                                log(f"🔄 重连成功,继续对话")
+                        else:
+                            time.sleep(0.01)
                         continue
                     # M1.5-b 二次唤醒切换:engaged 收到"小艺" → 立即切换转向新人。
                     # behavior 负责转向(写 st.state),main 这里只置 flag + 丢弃A重开会话(给B干净对话)。

@@ -354,9 +354,15 @@ class RealtimeDialog:
         self.no_memory = no_memory
         self.conv = None
         self._last_inject_fail = 0.0
+        self._last_connect_at = 0.0
+        self._min_connect_gap = 1.0
 
     def open_session(self, timeout: float = CONNECT_TIMEOUT_S):
         """新建 WS + update_session,timeout 内未就绪 → None。"""
+        gap = time.monotonic() - self._last_connect_at
+        if gap < self._min_connect_gap:
+            time.sleep(self._min_connect_gap - gap)
+        self._last_connect_at = time.monotonic()
         st = self.st
         st.session_updated.clear()
         c = OmniRealtimeConversation(model=MODEL, callback=self.callback)
