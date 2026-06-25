@@ -15,8 +15,13 @@
 
 ## Key Learnings
 
-- **Project:** shadow-yunwu-claudecode-aibasicalgodevdept-20260529
-- **Description:** 把一台 [Reachy Mini Lite](https://www.pollen-robotics.com/reachy-mini/)(USB 版)变成一个
+- **Project:** Reachy Mini Lite 语音交互机器人(USB 版)，Qwen3.5-Omni-Realtime 驱动
+- **运行环境:** macOS Intel + Python 3.12 + dashscope SDK
+- **视觉后端:** YuNet 默认(100%检出率), MediaPipe 可选(--face-mp), ArcFace 身份识别
+- **语音协议:** Qwen-Omni-Realtime WebSocket, update_session 做记忆注入(整体替换), 非 create_item(只增不删)
+- **状态机:** 9 态 FSM, TRACKING 态是核心对话状态, 方向门控只在此状态生效
+- **记忆存储:** per-person JSON facts (`data/memories/<pid>.json`), 对话摘要(conversation_summaries)
+- **清华镜像:** UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/ 所有 pip/uv 安装必用
 
 ## Do-Not-Repeat
 
@@ -29,6 +34,11 @@
 - [2026-06-24] **不要新增 tab 展示调试信息**: 用户明确要求复用已有的 Conversation 面板 payload modal，不要加新的 tab 或按钮。
 - [2026-06-24] **音频闸门不能每次 close_session 都触发**: 只在二次唤醒切人且 DOA 声源方向大幅变化(>SWITCH_AWAY_DEG)时关闸，避免常规断连重连时误拦截音频。
 - [2026-06-24] **必须遵循 CLAUDE.md 更新 wolf 文件**: 每次代码改动后必须更新 memory.md(行为日志)、cerebrum.md(学习)、anatomy.md(文件描述)。用户会检查。
+
+- [2026-06-25] **门控逻辑用白名单不用黑名单**: 只在 TRACKING 时关门(有人脸在面前对话)，其他状态一律放行。黑名单逐个豁免状态容易漏，且新状态默认被关门导致静音断连。
+- [2026-06-25] **d01 重构要领域驱动**: 移动代码时按领域归属(语音/记忆/感知)分配模块，不按"从哪里提取"机械分配。ChatCallback + 闭包 → 完整对话协议层(realtime.py)，不是"callback.py"。
+- [2026-06-25] **多线程 flag 消费顺序**: 清除 flag 必须在写入后续 state 之后(同一锁或之后的锁内)，否则其他线程在 flag=False + state=旧值 窗口误判。不要用超时阈值修补竞态——调整操作顺序消除窗口。
+- [2026-06-25] **conv=None 时 KWS 唤醒不能丢弃**: audio loop 在非 ARMED 状态 conv=None 时必须处理 KWS 命中(重连 WS)，否则 WS 意外断连后永远唤不醒。
 
 ## Decision Log
 
@@ -114,6 +124,12 @@
 - 上下文过长自动摘要: 每次 user transcript append 后估算 token(中文字数×1.5)，超过 CONV_SUMMARY_THRESHOLD(2000) 自动触发后台摘要+清桶
 - 摘要完成后如果仍在和该人对话，设 identity_injected=False 触发下一帧重新注入
 - Dashboard: 事件 payload modal 增加 Session Instructions + Memory Prompt + Conversation Log 显示
+
+### 方向门控白名单化 (2026-06-25)
+- 问题: 黑名单门控(逐个豁免状态)导致唤醒时 DOA 残留关门 → 纯静音 → 服务端断连
+- 修复: 改为白名单: `state != ST_TRACKING` — 仅 TRACKING(面前有人在对话)时屏蔽范围外声音
+- 其他状态(ARMED/IDLE/ENGAGING/SEARCHING/RETURNING/POINTING/PLAYING)一律放行
+- 原因: 只有锁定人脸且正在对话时才需要过滤其他方向的干扰; 其他状态要么没人、要么在找人, 关门只会送静音导致断连
 
 ### 多人脸 DOA 说话人选择 (2026-06-24)
 - vision_worker 输出 all_faces: 所有 YuNet/MediaPipe 检测到的脸 [{u,v,h,box,kps}]
