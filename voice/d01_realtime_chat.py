@@ -1545,7 +1545,8 @@ def main() -> int:
     _memory_mgr = MemoryManager(owner_mgr=_owner_mgr,
                                  face_db=_id_recognizer.db)
     _roi_detector = _make_roi_detector()   # 方案B:识别走全分辨率 ROI 重检
-    _face_pipeline = FaceReIDPipeline(_make_face_embedder(_id_recognizer, _roi_detector), FaceSystemConfig())
+    _face_pipeline = FaceReIDPipeline(_make_face_embedder(_id_recognizer, _roi_detector),
+                                      FaceSystemConfig(), log_fn=log)
     _n_gal = _face_pipeline.load_gallery()
     log(f"🧬 ReID pipeline 就绪(ByteTrack + 三区间, gallery {_n_gal} 人)")
     if _id_recognizer.startup_merged:

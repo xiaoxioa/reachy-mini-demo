@@ -240,7 +240,8 @@ def vis_debug_server(st: State, port: int, stop: threading.Event) -> None:
                          _cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 120, 255), 1)
 
         # ── 左上角：状态机信息（白字黑底）──
-        now_s = time.strftime("%H:%M:%S")
+        _tnow = time.time()
+        now_s = time.strftime("%H:%M:%S", time.localtime(_tnow)) + f".{int((_tnow % 1) * 1000):03d}"
         lines = [
             f"[{state_name}]",
             f"yaw={ty:+.1f}deg  pitch={tp:+.1f}deg",
@@ -253,6 +254,12 @@ def vis_debug_server(st: State, port: int, stop: threading.Event) -> None:
             _cv2.putText(bgr, line, (2, y),
                          _cv2.FONT_HERSHEY_SIMPLEX, 0.48,
                          (0, 255, 255) if i == 0 else (255, 255, 255), 1)
+
+        # ── 右上角：醒目大时间戳（HH:MM:SS.mmm,与 log 对应,便于定位问题帧）──
+        (_tsw, _tsh), _ = _cv2.getTextSize(now_s, _cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        _cv2.rectangle(bgr, (W - _tsw - 12, 2), (W, _tsh + 14), (0, 0, 0), -1)
+        _cv2.putText(bgr, now_s, (W - _tsw - 8, _tsh + 8),
+                     _cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         # ── 底部诊断行：区分"没检出"和"管线未写入"──
         if det is None:

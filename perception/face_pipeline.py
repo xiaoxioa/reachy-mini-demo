@@ -52,7 +52,7 @@ class FaceReIDPipeline:
 
     def __init__(self, embedder: Embedder, config: FaceSystemConfig | None = None,
                  emb_per_frame_budget: int = 2, per_track_emb_interval_s: float = 0.35,
-                 refresh_interval_s: float = 2.0):
+                 refresh_interval_s: float = 2.0, log_fn=None):
         self.cfg = config or FaceSystemConfig()
         self.embedder = embedder
         self.tracker = ByteTracker(self.cfg.tracking)
@@ -60,6 +60,7 @@ class FaceReIDPipeline:
         self._emb_budget = emb_per_frame_budget
         self._track_interval = per_track_emb_interval_s
         self._refresh_interval = refresh_interval_s
+        self._log_fn = log_fn        # 识别可观测:每次 track 绑定/新建身份时打印(含距离)
         # per-track 状态:上次提特征时刻 / 连续 unknown 帧数
         self._last_emb: dict[int, float] = {}
         self._unknown_cnt: dict[int, int] = {}
@@ -149,10 +150,12 @@ class FaceReIDPipeline:
 
     # ── 内部 ──────────────────────────────────────────────
     def _needs_embedding(self, trk: STrack, now: float) -> bool:
+        # Q4 身份冻结:已绑定 track 不再识别(只有新/未绑定 track 才跑识别);
+        # 配合稳定 track(DECIMATE=3),"track_id 变了才识别、track 在则身份不变"。
+        if trk.identity_id is not None:
+            return False
         last = self._last_emb.get(trk.track_id, 0.0)
-        if trk.identity_id is None:
-            return (now - last) >= self._track_interval        # 未识别:积极取特征
-        return (now - last) >= self._refresh_interval          # 已识别:慢刷新
+        return (now - last) >= self._track_interval            # 未识别:积极取特征直到绑定
 
     def _extract(self, trk: STrack, full_rgb: np.ndarray, decimate: int):
         x1, y1, x2, y2 = trk.bbox
@@ -175,6 +178,7 @@ class FaceReIDPipeline:
         probe = trk.smooth_embedding
         if probe is None:
             return
+        _old = trk.identity_id
         r = self.store.match(probe, quality)
         if r.zone == "known":
             trk.identity_id = r.identity_id
@@ -184,6 +188,9 @@ class FaceReIDPipeline:
             self._unknown_cnt[trk.track_id] = 0
             if quality >= self.cfg.identity.min_quality:
                 self.store.match_and_update(probe, quality)   # 刷 gallery
+            if self._log_fn and r.identity_id != _old:        # 仅在绑定/换人时打印
+                self._log_fn(f"🔍 track {trk.track_id} → {r.identity_name} "
+                             f"(known dist={r.distance:.3f} q={quality:.2f})")
         elif r.zone == "unsure":
             trk.identity_zone = "unsure"                       # 不提交身份,继续跟踪
         else:  # unknown
@@ -196,6 +203,9 @@ class FaceReIDPipeline:
                 trk.identity_id = ur.identity_id
                 trk.identity_name = ur.identity_name
                 trk.identity_confidence = ur.confidence
+                if self._log_fn:
+                    self._log_fn(f"🔍 track {trk.track_id} → 新建 {ur.identity_name} "
+                                 f"(unknown dist={r.distance:.3f})")
 
     def _order_by_doa(self, active, all_faces, doa_idx):
         if doa_idx is None or not all_faces or doa_idx >= len(all_faces):
