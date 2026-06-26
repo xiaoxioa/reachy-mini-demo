@@ -393,14 +393,56 @@ def frame_pump_loop(mini: ReachyMini, st: State, frame_q, stop: threading.Event)
             cap.release()
 
 
-def _make_face_embedder(rec):
-    """给 FaceReIDPipeline 注入 ArcFace 提特征器:全分辨率帧 + 5点 kps → 对齐 → 512d L2。"""
+def _make_roi_detector():
+    """主进程惰性 SCRFD(只用于识别路径的全分辨率 ROI 重检,与子进程跟踪检测解耦)。
+    失败返回 None(embedder 退化为用跟踪给的粗 kps)。"""
+    try:
+        from insightface.app import FaceAnalysis
+        _app = FaceAnalysis(name="buffalo_sc", allowed_modules=["detection"],
+                            providers=["CPUExecutionProvider"])
+        _app.prepare(ctx_id=-1, det_size=(320, 320), det_thresh=0.5)  # ROI 小,320 足够且快
+        det = _app.models.get("detection") or getattr(_app, "det_model", None)
+        log("🔬 识别 ROI 重检器就绪(全分辨率 sharp kps)")
+        return det
+    except Exception as e:
+        log(f"⚠ ROI 重检器初始化失败({type(e).__name__}),识别退化用跟踪粗 kps")
+        return None
+
+
+def _roi_redetect_kps(detector, full_rgb, box_xywh):
+    """在全分辨率帧上对人脸 box 的扩展 ROI 重跑 SCRFD,拿亚像素 sharp kps(全分辨率坐标)。
+    返回 [(x,y)*5] 或 None。"""
+    try:
+        H, W = full_rgb.shape[:2]
+        x, y, w, h = box_xywh
+        if w <= 0 or h <= 0:
+            return None
+        m = 0.4                                   # ROI 外扩,确保整脸在内
+        x0 = max(0, int(x - m * w)); y0 = max(0, int(y - m * h))
+        x1 = min(W, int(x + w + m * w)); y1 = min(H, int(y + h + m * h))
+        if x1 - x0 < 24 or y1 - y0 < 24:
+            return None
+        roi_bgr = np.ascontiguousarray(full_rgb[y0:y1, x0:x1, ::-1])  # RGB→BGR
+        bboxes, kpss = detector.detect(roi_bgr, max_num=1, metric="default")
+        if kpss is None or len(kpss) == 0:
+            return None
+        kp = kpss[0]                              # ROI 坐标 → 偏回全分辨率
+        return [(float(kp[i][0] + x0), float(kp[i][1] + y0)) for i in range(5)]
+    except Exception:
+        return None
+
+
+def _make_face_embedder(rec, roi_detector=None):
+    """给 FaceReIDPipeline 注入 ArcFace 提特征器:全分辨率帧 → (ROI 重检 sharp kps 优先,
+    否则跟踪粗 kps)→ 5点对齐 → 512d L2。方案B:识别精度不受跟踪降采样影响。"""
     from identity.recognizer import _align_face, _crop_face
 
     def _embed(full_rgb, box_xywh, kps):
         try:
-            if kps and len(kps) == 5:
-                aligned = _align_face(full_rgb, kps)
+            sharp = _roi_redetect_kps(roi_detector, full_rgb, box_xywh) if roi_detector is not None else None
+            use_kps = sharp if sharp is not None else kps
+            if use_kps and len(use_kps) == 5:
+                aligned = _align_face(full_rgb, use_kps)
             else:
                 aligned = _crop_face(full_rgb, box_xywh)
             return rec.arcface.get_embedding(aligned)
@@ -452,6 +494,7 @@ def vision_result_loop(st: State, result_q, stop: threading.Event,
         face_kps = msg.get("face_kps")
         all_faces = msg.get("all_faces")
         _doa_selected_idx = None
+        _track_views = None        # 每 track 视图(身份+trackid),供 dashboard 每框绘制
         if all_faces and len(all_faces) > 1:
             with st.lock:
                 _doa_r = st.doa_resid_stable
@@ -475,7 +518,7 @@ def vision_result_loop(st: State, result_q, stop: threading.Event,
                     _full_rgb = np.ascontiguousarray(_raw_frame[:, :, ::-1])  # 全分辨率 BGR→RGB
                     _H0, _W0 = _raw_frame.shape[:2]
                     _dw, _dh = _W0 // DECIMATE, _H0 // DECIMATE   # 与 frame_pump 的 resize 尺寸精确一致
-                    _primary, _ = _face_pipeline.process(
+                    _primary, _track_views = _face_pipeline.process(
                         all_faces, (_dw, _dh), _full_rgb, DECIMATE, now, _doa_selected_idx)
                     if _primary is not None:
                         u_raw, v_raw = _primary.u, _primary.v
@@ -729,6 +772,19 @@ def vision_result_loop(st: State, result_q, stop: threading.Event,
                 st.user_frown = msg.get("frown", 0.0)
 
         if VIS_DEBUG:
+            # 每 track 视图:真实框(降采样像素)+ 身份(Unknown-N/真名)+ trackid + 是否选中
+            _tv = []
+            if _track_views:
+                _sel_tid = _primary.track_id if _primary is not None else None
+                for v in _track_views:
+                    _tv.append({
+                        "box": v.bbox_px,           # [x1,y1,x2,y2] 降采样像素
+                        "track_id": v.track_id,
+                        "name": v.person_name,      # Unknown-N / 真名 / None(未绑定)
+                        "zone": v.zone,
+                        "confirmed": v.is_confirmed,
+                        "selected": (v.track_id == _sel_tid),
+                    })
             with st.lock:
                 st.dbg_det = {
                     "face": msg.get("face"),
@@ -737,6 +793,7 @@ def vision_result_loop(st: State, result_q, stop: threading.Event,
                     "n_faces": msg.get("n_faces", 0),
                     "all_faces": all_faces,
                     "doa_selected_idx": _doa_selected_idx,
+                    "track_views": _tv,     # 方案B显示:每框身份+trackid
                 }
 
         if now - stat_t >= 10.0:
@@ -1487,7 +1544,8 @@ def main() -> int:
     _id_recognizer = IdentityRecognizer()
     _memory_mgr = MemoryManager(owner_mgr=_owner_mgr,
                                  face_db=_id_recognizer.db)
-    _face_pipeline = FaceReIDPipeline(_make_face_embedder(_id_recognizer), FaceSystemConfig())
+    _roi_detector = _make_roi_detector()   # 方案B:识别走全分辨率 ROI 重检
+    _face_pipeline = FaceReIDPipeline(_make_face_embedder(_id_recognizer, _roi_detector), FaceSystemConfig())
     _n_gal = _face_pipeline.load_gallery()
     log(f"🧬 ReID pipeline 就绪(ByteTrack + 三区间, gallery {_n_gal} 人)")
     if _id_recognizer.startup_merged:
@@ -1562,7 +1620,8 @@ def main() -> int:
 
             dialog = RealtimeDialog(st, play_q, motion_q, snap_q, mini,
                                      oai, _memory_mgr, _owner_mgr, _id_recognizer,
-                                     active_instructions, active_tools, no_memory)
+                                     active_instructions, active_tools, no_memory,
+                                     face_pipeline=_face_pipeline)
 
             conv = None
             kws_gate = None
@@ -1850,6 +1909,12 @@ def main() -> int:
                 if _memory_mgr is not None:
                     _memory_mgr.flush()
                     log("💾 记忆已持久化")
+                if _face_pipeline is not None:
+                    try:
+                        _face_pipeline.save_gallery()
+                        log(f"💾 gallery 已持久化({len(_face_pipeline.store.identities)} 身份)")
+                    except Exception as _e:
+                        log(f"⚠ gallery 落盘失败:{type(_e).__name__}")
         finally:
             try:
                 mini.set_automatic_body_yaw(True)

@@ -39,6 +39,7 @@ class TrackView:
     person_name: Optional[str]
     zone: str                 # known | unsure | unknown | ""
     confidence: float
+    is_confirmed: bool = False   # gallery 身份是否已用户确认(命名)
 
 
 def _xywh_to_xyxy(box):
@@ -212,15 +213,17 @@ class FaceReIDPipeline:
             for tid in [k for k in d if k not in alive]:
                 d.pop(tid, None)
 
-    @staticmethod
-    def _view(t: STrack) -> TrackView:
+    def _view(self, t: STrack) -> TrackView:
         b = t.bbox
+        _conf = bool(t.identity_id and t.identity_id in self.store.identities
+                     and self.store.identities[t.identity_id].is_confirmed)
         return TrackView(
             track_id=t.track_id, u=0.0, v=0.0, h=0.0,
             bbox_px=(float(b[0]), float(b[1]), float(b[2]), float(b[3])),
             state="confirmed" if t.is_confirmed() else "tentative",
             person_id=t.identity_id, person_name=t.identity_name,
-            zone=getattr(t, "identity_zone", ""), confidence=t.identity_confidence)
+            zone=getattr(t, "identity_zone", ""), confidence=t.identity_confidence,
+            is_confirmed=_conf)
 
     @staticmethod
     def _normalize(v: Optional[TrackView], W: int, H: int) -> Optional[TrackView]:

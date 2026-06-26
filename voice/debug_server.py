@@ -133,10 +133,29 @@ def vis_debug_server(st: State, port: int, stop: threading.Event) -> None:
         bgr = _cv2.cvtColor(rgb, _cv2.COLOR_RGB2BGR)
         H, W = bgr.shape[:2]
 
-        # ── 人脸框（多人脸: 选中=蓝, 非选中=灰; 单脸=蓝）──
+        # ── 人脸框：优先 track_views(每框常驻身份+trackid),否则回退 all_faces/face ──
+        _track_views = det.get("track_views") if det else None
         _all_faces = det.get("all_faces") if det else None
         _doa_sel = det.get("doa_selected_idx") if det else None
-        if _all_faces and len(_all_faces) > 1:
+        if _track_views:
+            for _v in _track_views:
+                _b = _v.get("box")
+                if not _b:
+                    continue
+                _ax0, _ay0, _ax1, _ay1 = int(_b[0]), int(_b[1]), int(_b[2]), int(_b[3])
+                _is_sel = bool(_v.get("selected"))
+                _is_conf = bool(_v.get("confirmed"))
+                _bcolor = (255, 80, 0) if _is_sel else (150, 150, 150)  # 选中=蓝, 其余=灰
+                _cv2.rectangle(bgr, (_ax0, _ay0), (_ax1, _ay1), _bcolor, 2 if _is_sel else 1)
+                # 顶部标签:身份(未确认 Unknown-N / 已确认真名)+ trackid —— 每框常驻
+                _nm = _v.get("name") or "?"
+                _top = f"{_nm} T{_v.get('track_id')}"
+                _cjk_w = sum(18 if ord(c) > 127 else 10 for c in _top) + 6
+                _lblc = (255, 80, 0) if _is_sel else ((0, 140, 0) if _is_conf else (90, 90, 90))
+                _ly = _ay0 - 20 if _ay0 - 20 >= 0 else _ay1   # 靠顶则画到框下方
+                _cv2.rectangle(bgr, (_ax0, _ly), (_ax0 + _cjk_w, _ly + 20), _lblc, -1)
+                _put_cjk_text(bgr, _top, (_ax0 + 2, _ly + 2), (255, 255, 255))
+        elif _all_faces and len(_all_faces) > 1:
             for _fi, _af in enumerate(_all_faces):
                 _is_sel = (_doa_sel is not None and _fi == _doa_sel)
                 _afu, _afv, _afh = _af["u"], _af["v"], _af["h"]

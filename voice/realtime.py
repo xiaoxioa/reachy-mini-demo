@@ -55,7 +55,7 @@ class ChatCallback(OmniRealtimeCallback):
 
     def __init__(self, st: State, play_q: "queue.Queue", motion_q: "queue.Queue",
                  snap_q: "queue.Queue", mini: ReachyMini,
-                 memory_mgr, owner_mgr, id_recognizer):
+                 memory_mgr, owner_mgr, id_recognizer, face_pipeline=None):
         self.st = st
         self.play_q = play_q
         self.motion_q = motion_q
@@ -64,6 +64,7 @@ class ChatCallback(OmniRealtimeCallback):
         self.memory_mgr = memory_mgr
         self.owner_mgr = owner_mgr
         self.id_recognizer = id_recognizer
+        self.face_pipeline = face_pipeline   # 命名时落 gallery(confirm_identity)
         self.conv: OmniRealtimeConversation | None = None
         self.dialog: "RealtimeDialog | None" = None
         self.exit_i = 0
@@ -230,6 +231,14 @@ class ChatCallback(OmniRealtimeCallback):
                                 self.memory_mgr.set_name(pid, new_name)
                                 if self.id_recognizer is not None:
                                     self.id_recognizer.db.set_name(pid, new_name)
+                                # 命名 → gallery 确认(provisional→confirmed,带真名)并落盘
+                                if self.face_pipeline is not None:
+                                    try:
+                                        if self.face_pipeline.store.confirm_identity(pid, new_name):
+                                            self.face_pipeline.save_gallery()
+                                            log(f"🏷 gallery 身份已确认并落盘: {new_name} ({pid[:12]})")
+                                    except Exception as _e:
+                                        log(f"⚠ gallery 命名失败:{type(_e).__name__}: {_e}")
                                 with st.lock:
                                     st.current_person_name = new_name
                                 if self.owner_mgr is not None and not self.owner_mgr.has_owner():
@@ -357,9 +366,11 @@ class RealtimeDialog:
 
     def __init__(self, st: State, play_q, motion_q, snap_q, mini: ReachyMini,
                  oai_client, memory_mgr, owner_mgr, id_recognizer,
-                 instructions: str, tools: list, no_memory: bool = False):
+                 instructions: str, tools: list, no_memory: bool = False,
+                 face_pipeline=None):
         self.callback = ChatCallback(st, play_q, motion_q, snap_q, mini,
-                                     memory_mgr, owner_mgr, id_recognizer)
+                                     memory_mgr, owner_mgr, id_recognizer,
+                                     face_pipeline=face_pipeline)
         self.callback.dialog = self
         self.st = st
         self.oai = oai_client
