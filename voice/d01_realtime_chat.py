@@ -1763,6 +1763,7 @@ def main() -> int:
             sent_samples = 0
             rms_acc: list[float] = []
             rms_t = time.monotonic()
+            vid_send_t = 0.0          # 视频送帧节流(1fps)
             t_run0 = time.monotonic()
             greet_i = 0   # 唤醒招呼轮换索引
             greet_sent_at = 0.0
@@ -1950,6 +1951,22 @@ def main() -> int:
                             log("🔄 自动重连成功，继续上行")
                         continue
                     sent_samples += len(mono)
+                    # ── 视频流送 Omni:每 1s 一帧 720p JPEG(模型实时看见画面,替代 take_snapshot)──
+                    _now_v = time.monotonic()
+                    if _now_v - vid_send_t >= 1.0:
+                        vid_send_t = _now_v
+                        with st.lock:
+                            _vframe = st.latest_frame
+                        if _vframe is not None:
+                            try:
+                                _vh, _vw = _vframe.shape[:2]
+                                if _vw > 1280:                       # 降到 720p(宽 1280)
+                                    _vframe = cv2.resize(_vframe, (1280, int(_vh * 1280.0 / _vw)))
+                                _ok, _jpg = cv2.imencode(".jpg", _vframe, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                                if _ok:
+                                    conv.append_video(base64.b64encode(_jpg.tobytes()).decode("ascii"))
+                            except Exception as _ve:
+                                log(f"⚠ 送视频帧失败:{type(_ve).__name__}")
                     if time.monotonic() - rms_t >= 10.0:
                         rms = float(np.mean(rms_acc)) if rms_acc else 0.0
                         if rms < 0.005:

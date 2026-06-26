@@ -25,11 +25,10 @@ INSTRUCTIONS = (
     "回答时自然地配合动作工具表达身体语言:打招呼/同意时点头,否定时摇头,"
     "开心/兴奋/被夸时摆天线,好奇/疑惑时歪头。"
     "重要:做动作时必须同时用语音回应,边说边做;绝不要默默做动作不说话。"
-    "用户让你看东西时调用 take_snapshot,拿到画面描述后用自己的话自然地告诉用户你看到了什么。"
-    "当用户用手指指着某个方向或物体,说'看看那边''这是什么''我指的是什么''那里有什么'等,"
-    "调用 identify_pointed_object——它会自动判断指向、需要时转头去看,拿到结果后自然地说出来。"
-    "⚠ 绝不要用 look_left/right 代替'看':那只是肢体动作不会拍照。"
-    "要看某个方向有什么,正确做法是调 identify_pointed_object(会自动转头+拍照)或先 look_X 再 take_snapshot。"
+    "你的摄像头画面会持续实时提供给你(每秒约一帧),你一直能看见眼前的场景。"
+    "用户让你看东西、问'你看到了什么''我手里拿的是什么''我比的是什么手势''这是什么''那边有什么'等"
+    "视觉问题时,直接参考你最近看到的画面,用自己的话自然地说出来,不需要调用任何工具。"
+    "若目标在当前画面外(比如让你看某个方向),可先用 look_left/right/up/down 转头,转过去后画面会随之更新,再看再答。"
     "【最重要的规则——你的文字会被语音合成直接朗读给用户听】"
     "你的每一个字、每一个符号都会被TTS引擎原样朗读出来。"
     "所以绝对不能在文字中写任何标记、标签、动作描述:"
@@ -243,13 +242,13 @@ BASE_TOOLS = [
     {"type": "function", "name": "shake_head",
      "description": "摇头。否定、拒绝、不同意、说'不'时使用。", "parameters": _NOPARAM},
     {"type": "function", "name": "look_left",
-     "description": "把头转向左边(仅肢体动作,不拍照不看东西)。要看左边是什么请先look_left再take_snapshot。", "parameters": _NOPARAM},
+     "description": "把头转向左边。转过去后摄像头画面会更新,就能看到左边有什么。", "parameters": _NOPARAM},
     {"type": "function", "name": "look_right",
-     "description": "把头转向右边(仅肢体动作,不拍照不看东西)。要看右边是什么请先look_right再take_snapshot。", "parameters": _NOPARAM},
+     "description": "把头转向右边。转过去后摄像头画面会更新,就能看到右边有什么。", "parameters": _NOPARAM},
     {"type": "function", "name": "look_up",
-     "description": "抬头看上方(仅肢体动作,不拍照不看东西)。要看上面是什么请先look_up再take_snapshot。", "parameters": _NOPARAM},
+     "description": "抬头转向上方。转过去后摄像头画面会更新,就能看到上面有什么。", "parameters": _NOPARAM},
     {"type": "function", "name": "look_down",
-     "description": "低头看下方(仅肢体动作,不拍照不看东西)。要看下面是什么请先look_down再take_snapshot。", "parameters": _NOPARAM},
+     "description": "低头转向下方。转过去后摄像头画面会更新,就能看到下面有什么。", "parameters": _NOPARAM},
     {"type": "function", "name": "wiggle_antennas",
      "description": "欢快地摆动头顶天线。表达开心、兴奋、被夸奖、热情时使用。", "parameters": _NOPARAM},
     {"type": "function", "name": "tilt_head",
@@ -260,13 +259,8 @@ BASE_TOOLS = [
                     "⚠️ 注意:「再说吧」「这个先放一边」「等会儿」「待会聊」「先放着」「回头说」等只是话题搁置或语气词,"
                     "【不是】结束对话,绝不要因此调用;拿不准时继续对话、不要调。",
      "parameters": _NOPARAM},
-    {"type": "function", "name": "take_snapshot",
-     "description": "用摄像头拍一张当前画面并理解内容。当用户让你看东西、问'你看到什么''我手里是什么'等需要视觉、但不涉及'指向'的问题时调用。",
-     "parameters": _NOPARAM},
-    {"type": "function", "name": "identify_pointed_object",
-     "description": "当用户在用手指指方向或指物体时调用——包括'这是什么''我指的是什么''看看那边''那里有什么'等。"
-                    "会自动判断指向方向,需要时转头去看,然后拍照理解目标。优先于 look_left/right + take_snapshot 组合。",
-     "parameters": _NOPARAM},
+    # take_snapshot / identify_pointed_object 已移除:改为实时视频流(append_video, 1fps)
+    # 直接喂模型,模型一直能看见画面,被问视觉问题直接答,无需工具往返。
 ]
 
 # ── 看图 prompt ──
