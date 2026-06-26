@@ -241,7 +241,8 @@ def vision_worker(face_model: str, hand_model: str, frame_q, result_q,
     """子进程入口:Face(每帧) + Hand(自适应提频)。
 
     人脸后端通过环境变量 FACE_BACKEND 切换:
-      yunet (默认) — OpenCV YuNet, 零额外依赖, 全角度高检出率
+      scrfd (默认) — InsightFace SCRFD, 关键点质量更稳, 原生 per-face 置信(ReID 主用)
+      yunet        — OpenCV YuNet, 零额外依赖, 全角度高检出率
       mediapipe    — MediaPipe FaceLandmarker VIDEO 模式(含 blendshape 表情)
 
     手势识别:

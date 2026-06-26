@@ -1592,7 +1592,7 @@ def main() -> int:
             _cb_ref[0] = dialog.callback
             _vis_enabled = os.path.exists(VIS_MODEL_PATH)
             if _vis_enabled:
-                _fb = os.environ.get("FACE_BACKEND", "yunet").lower()
+                _fb = os.environ.get("FACE_BACKEND", "scrfd").lower()
                 log(f"视觉后端: {_fb}" + (" (sticky OFF)" if no_sticky else ""))
                 if no_sticky:
                     os.environ["VISION_NO_STICKY"] = "1"
