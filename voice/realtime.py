@@ -55,7 +55,7 @@ class ChatCallback(OmniRealtimeCallback):
 
     def __init__(self, st: State, play_q: "queue.Queue", motion_q: "queue.Queue",
                  snap_q: "queue.Queue", mini: ReachyMini,
-                 memory_mgr, owner_mgr, id_recognizer, face_pipeline=None):
+                 memory_mgr, owner_mgr, id_recognizer, face_pipeline=None, asd_engine=None):
         self.st = st
         self.play_q = play_q
         self.motion_q = motion_q
@@ -65,6 +65,8 @@ class ChatCallback(OmniRealtimeCallback):
         self.owner_mgr = owner_mgr
         self.id_recognizer = id_recognizer
         self.face_pipeline = face_pipeline   # 命名时落 gallery(confirm_identity)
+        self.asd_engine = asd_engine         # 谁在说话:本句归属用 speaker_window
+        self._speech_start_t = 0.0           # 本句说话起点(monotonic),speech_started 时记
         self.conv: OmniRealtimeConversation | None = None
         self.dialog: "RealtimeDialog | None" = None
         self.exit_i = 0
@@ -114,6 +116,7 @@ class ChatCallback(OmniRealtimeCallback):
                     log("✅ 会话 instructions 已更新")
                 st.session_updated.set()
             elif etype == "input_audio_buffer.speech_started":
+                self._speech_start_t = now           # 本句说话起点(供 ASD speaker_window 归属)
                 with st.lock:
                     st.last_interaction_at = now
                     st.user_speaking = True
@@ -129,10 +132,22 @@ class ChatCallback(OmniRealtimeCallback):
                 log("🤫 检测到你说完了,等模型回应…")
             elif etype == "conversation.item.input_audio_transcription.completed":
                 _transcript = (event.get("transcript") or "").strip()
-                # ── ASD 归属:本句说话人(画面内)/ 画外(无画面说话人 → 专门标签)──
-                with st.lock:
-                    _asp = st.asd_speaker
-                if _asp is not None and (now - _asp.get("at", 0.0)) < 2.0:   # 宽限,耐 ASD 延迟
+                # ── ASD 归属:优先"本句说话期间任意时刻在说话"的 track(speaker_window,
+                #    耐 ASD 延迟,治"说完才出分"),否则当前保持的 asd_speaker,再否则画外 ──
+                _asp = None
+                _sw = (self.asd_engine.speaker_window(self._speech_start_t)
+                       if (self.asd_engine is not None and self.asd_engine.available) else None)
+                if _sw is not None and self.face_pipeline is not None:
+                    _trk = self.face_pipeline.tracker.find_track(_sw[0])
+                    if _trk is not None:
+                        _asp = {"pid": _trk.identity_id, "name": _trk.identity_name,
+                                "track_id": _sw[0], "score": _sw[1], "at": now}
+                if _asp is None:
+                    with st.lock:
+                        _hold = st.asd_speaker
+                    if _hold is not None and (now - _hold.get("at", 0.0)) < 2.0:
+                        _asp = _hold
+                if _asp is not None:
                     _tid = _asp.get("track_id")
                     _log_pid = _asp.get("pid") or f"_track{_tid}"      # 在画面但未识别:临时 track 键
                     _log_name = _asp.get("name") or f"?T{_tid}"
@@ -379,10 +394,10 @@ class RealtimeDialog:
     def __init__(self, st: State, play_q, motion_q, snap_q, mini: ReachyMini,
                  oai_client, memory_mgr, owner_mgr, id_recognizer,
                  instructions: str, tools: list, no_memory: bool = False,
-                 face_pipeline=None):
+                 face_pipeline=None, asd_engine=None):
         self.callback = ChatCallback(st, play_q, motion_q, snap_q, mini,
                                      memory_mgr, owner_mgr, id_recognizer,
-                                     face_pipeline=face_pipeline)
+                                     face_pipeline=face_pipeline, asd_engine=asd_engine)
         self.callback.dialog = self
         self.st = st
         self.oai = oai_client

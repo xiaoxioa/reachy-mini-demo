@@ -200,11 +200,12 @@ class AsdEngine:
               读 scores() 或 speaker()。"""
 
     def __init__(self, detector: "SpeakerDetector | None" = None,
-                 win_frames: int = 25, min_frames: int = 12,
+                 win_frames: int = 48, min_frames: int = 12, win_seconds: float = 1.3,
                  score_interval_s: float = 0.16, crop_fps: int = VIDEO_FPS,
                  ema: float = 0.5, speak_thresh: float = 0.0, stale_s: float = 1.0):
         self.detector = detector or SpeakerDetector()
         self.win = win_frames
+        self.win_seconds = win_seconds
         self.min_frames = min_frames
         self.score_interval = score_interval_s
         self.crop_dt = 1.0 / float(crop_fps)
@@ -300,7 +301,11 @@ class AsdEngine:
             for tid, crops in items:    # crops: [(t, gray), ...]
                 if len(crops) < self.min_frames:
                     continue
-                t0, t1 = crops[0][0], crops[-1][0]
+                t1 = crops[-1][0]
+                crops = [c for c in crops if c[0] >= t1 - self.win_seconds]  # 时间窗封顶,低 fps 不稀释
+                if len(crops) < self.min_frames:
+                    continue
+                t0 = crops[0][0]
                 span = t1 - t0
                 if span < 0.4:                                  # 不足 ~0.4s 不评
                     continue

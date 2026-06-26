@@ -1705,7 +1705,7 @@ def main() -> int:
             dialog = RealtimeDialog(st, play_q, motion_q, snap_q, mini,
                                      oai, _memory_mgr, _owner_mgr, _id_recognizer,
                                      active_instructions, active_tools, no_memory,
-                                     face_pipeline=_face_pipeline)
+                                     face_pipeline=_face_pipeline, asd_engine=_asd_engine)
 
             conv = None
             kws_gate = None
