@@ -324,6 +324,22 @@
       ],
       "occurrences": 1,
       "last_seen": "2026-06-26T15:10:00.000Z"
+    },
+    {
+      "id": "bug-020",
+      "timestamp": "2026-06-27T02:55:14.490Z",
+      "error_message": "Significant refactor of ",
+      "file": "voice/config.py",
+      "root_cause": "28 lines replaced/restructured",
+      "fix": "Rewrote 35→12 lines (28 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-06-27T02:55:14.491Z"
     }
   ]
 }

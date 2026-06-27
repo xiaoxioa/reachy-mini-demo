@@ -599,17 +599,17 @@ class RealtimeDialog:
                 "   - 用户说'我喜欢X' → {\"喜欢的东西\": \"X\"}\n"
                 "   - 如果新信息与旧 fact 矛盾，保留新的 value，同 key 覆盖\n"
                 "   - 不要把名字放进 facts（名字在独立字段管理）\n"
-                "2. summary = 基于所有 facts 和对话理解，写一句话描述你对这个人的整体认知。\n"
-                "   - 体现对用户的整体理解，不是列举属性\n"
-                "   - 用「用户」指代，例如：'用户喜欢打篮球和看科幻小说，最近在关注《黑暗森林》上线'\n"
-                "3. episode = 这次对话的结构化事件\n"
-                "   - topic: 具体说聊了什么，不要太笼统，用「用户」指代\n"
-                "   - highlights: 关键信息点（每条是完整短句），用「用户」指代\n\n"
+                "2. summary = 一句话介绍这位用户。\n"
+                "   - 体现对用户的整体理解，总结facts和对话而不是列举属性\n"
+                "   - 仅做描述，例如：'喜欢打篮球和看科幻小说，最近在关注《黑暗森林》上线'\n"
+                "3. episode = 客观总结这次对话的摘要事件\n"
+                "   - topic: 具体说聊了什么，不要太笼统\n"
+                "   - highlights: 关于用户的关键信息点（每条是完整短句）\n\n"
                 "只输出JSON：\n"
                 '{"name":"用户名字(对话中提到则更新,否则为null)",'
-                '"summary":"一句话认知描述(用\\"用户\\"指代)",'
+                '"summary":"一句话认知描述",'
                 '"facts":{"类别1":"内容1","类别2":"内容2"},'
-                '"episode":{"topic":"具体话题(用\\"用户\\"指代)","highlights":["要点1(用\\"用户\\"指代)"],"mood":"engaged/casual/emotional/tense"}}'
+                '"episode":{"topic":"具体话题","highlights":["要点1"],"mood":"engaged/casual/emotional/tense"}}'
             )
             resp = self.oai.chat.completions.create(
                 model=SUMMARY_MODEL,

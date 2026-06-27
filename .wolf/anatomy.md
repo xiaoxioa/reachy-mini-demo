@@ -1,11 +1,15 @@
 # anatomy.md
 
-> Auto-maintained by OpenWolf. Last scanned: 2026-06-26T09:54:31.010Z
-> Files: 57 tracked | Anatomy hits: 0 | Misses: 0
+> Auto-maintained by OpenWolf. Last scanned: 2026-06-27T03:28:12.795Z
+> Files: 58 tracked | Anatomy hits: 0 | Misses: 0
 
 ## ../../../../.claude/plans/
 
 - `rustling-booping-biscuit.md` — Facts 格式重构：list[str] → dict[str,str] + summary (~768 tok)
+
+## ../../../../Library/Application Support/Code/User/
+
+- `settings.json` (~327 tok)
 
 ## ./
 
@@ -98,9 +102,9 @@
 
 ## voice/
 
-- `config.py` — 配置常量、工具元数据、prompt 模板。 (~3060 tok)
+- `config.py` — 配置常量、工具元数据、prompt 模板。 (~2775 tok)
 - `d01_realtime_chat.py` — Reachy Mini × Qwen3.5-Omni-Realtime 语音对话(D-01+O-01a+V-01+F-01+FUSION-03+PLAY-01:完整体)。 (~25448 tok)
 - `debug_server.py` — VIS_DEBUG MJPEG HTTP 调试预览服务 + Conversation Dashboard。 (~17876 tok)
 - `kws.py` — WAKE-01 唤醒词门控(sherpa-onnx) (~991 tok)
-- `realtime.py` — Qwen-Omni-Realtime 对话协议层 — 回调 + 会话生命周期管理。 (~8836 tok)
+- `realtime.py` — Qwen-Omni-Realtime 对话协议层 — 回调 + 会话生命周期管理。 (~9050 tok)
 - `state.py` — 共享状态容器、日志、对话事件录制、One Euro 滤波器。 (~3110 tok)

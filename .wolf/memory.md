@@ -311,3 +311,29 @@
 | 17:53 | Session end: 17 writes across 7 files (d01_realtime_chat.py, state.py, realtime.py, config.py, person_f4e8c43f.json) | 9 reads | ~52848 tok |
 | 17:54 | Edited docs/QWEN_OMNI_TOOL_CALLING.md | expanded (+40 lines) | ~303 |
 | 17:55 | Session end: 18 writes across 7 files (d01_realtime_chat.py, state.py, realtime.py, config.py, person_f4e8c43f.json) | 9 reads | ~53172 tok |
+| 18:37 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 4 reads | ~53956 tok |
+| 18:41 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 4 reads | ~53956 tok |
+| 19:08 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 4 reads | ~53956 tok |
+| 09:59 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 4 reads | ~53956 tok |
+| 10:07 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 6 reads | ~53956 tok |
+| 10:09 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 6 reads | ~53956 tok |
+| 10:12 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 6 reads | ~53956 tok |
+
+## Session: 2026-06-27 10:20
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 10:55 | Edited voice/config.py | reduced (-23 lines) | ~124 |
+| 10:55 | Session end: 1 writes across 1 files (config.py) | 6 reads | ~44687 tok |
+| 10:59 | Session end: 1 writes across 1 files (config.py) | 6 reads | ~44687 tok |
+| 11:19 | Session end: 1 writes across 1 files (config.py) | 6 reads | ~44687 tok |
+| 11:21 | Edited voice/realtime.py | expanded (+6 lines) | ~55 |
+| 11:21 | Edited voice/realtime.py | removed 7 lines | ~10 |
+| 11:22 | Session end: 3 writes across 2 files (config.py, realtime.py) | 6 reads | ~45011 tok |
+
+## Session: 2026-06-27 11:24
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 11:28 | Edited ../../../../Library/Application Support/Code/User/settings.json | 2→3 lines | ~22 |
+| 11:28 | Session end: 1 writes across 1 files (settings.json) | 0 reads | ~22 tok |
