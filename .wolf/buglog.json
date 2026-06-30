@@ -472,6 +472,18 @@
       "related_bugs": ["bug-062"],
       "occurrences": 1,
       "last_seen": "2026-06-29T13:30:00.000Z"
+    },
+    {
+      "id": "bug-067",
+      "timestamp": "2026-06-29T15:50:00.000Z",
+      "error_message": "服务端错误事件 invalid_request_error: 'Conversation already has an active response'(真机日志 15:17:52,二次唤醒后)",
+      "file": "voice/d01_realtime_chat.py",
+      "root_cause": "时序竞态:对话中喊'小艺'二次唤醒后,用户紧接着又说话('小叶,小叶'),semantic_vad 在 speech_stopped 后会自动为这句起一个 active response;与此同时 behavior 锁脸置 greet_now → 音频循环'唤醒应答'又调 conv.create_response(招呼)→ 两个回复撞车。招呼守卫只看 in_flight>0,但用户这句的回复刚 transcription.completed、response.created 还没到 → in_flight 还是 0 → 守卫漏过 → create_response 撞上服务端已起的 active response。create_response 只发 WS 不等结果,错误是异步 error 事件回来,try/except 抓不到。",
+      "fix": "招呼守卫扩展:_busy = in_flight>0 OR st.thinking(speech_stopped→True、首音频→False,正好是'说完等回复'的竞态窗) OR (now - turn_speaker_at)<2s(刚有用户说话→服务端会自动起回复的兜底,时间自清不会卡死)。任一为真就跳过招呼(已有 '👋 唤醒应答跳过' 日志)。",
+      "tags": ["realtime", "race-condition", "create-response", "wake", "greet", "semantic-vad", "in-flight"],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-06-29T15:50:00.000Z"
     }
   ]
 }

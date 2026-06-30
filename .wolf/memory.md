@@ -169,3 +169,5 @@
 | 13:30 | DOA瞟头修复 F1+F4:本地麦响度绕开门控触发+按符号转固定大角(治侧边喊不转/转不够) | voice/d01_realtime_chat.py config.py state.py | py_compile过;bug-066;待真机验+调GLANCE_LOCAL_RMS | ~8k |
 | 15:30 | 二次唤醒A方案:对话中喊小艺→打断+天线heard+转DOA找喊话人,保留会话(去掉close/reopen) | voice/d01_realtime_chat.py | py_compile过;须不带--no-wake启动;待真机测 | ~5k |
 | 15:35 | 二次唤醒A方案真机验证通过:5次对话中喊小艺全触发打断+转向找喊话人(4粗方向+1confident),保留会话 | PROJECT_STATE.md | 验证通过;DOA多为粗方向(近似) | ~3k |
+| 15:50 | 修 bug-067: 二次唤醒后用户接话→招呼create_response撞semantic_vad自动回复(active response报错);守卫加thinking+turn_speaker_at<2s | voice/d01_realtime_chat.py | py_compile过 | ~3k |
+| 17:40 | codegraph 全工程分析:建索引(56文件/1339节点)+ 量化结构热点(god函数/77字段State单锁/重复定义/吞异常) | d01/state/actions | 产出优化清单待审 | ~9k |

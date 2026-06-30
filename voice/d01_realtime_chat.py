@@ -1964,12 +1964,15 @@ def main() -> int:
                                      else "无方向")
                             log(f"🔀 二次唤醒 → 打断+转向找喊话人({_hint});保留会话")
                     # 唤醒应答:SEEK 锁脸那刻 behavior 置 greet_now → 让模型招呼一句(走标准 response,可被打断)。
-                    # 守卫:仅当无回应在途(in_flight==0)才招呼——只喊"小艺"=模型空闲才招呼;带了后续话=模型已在答,不双答。
+                    # 守卫:仅当无回应在途/不在途才招呼——只喊"小艺"=模型空闲才招呼;带了后续话=模型已在答,不双答。
+                    # in_flight>0 漏掉"刚说完、回复还没+1"的竞态窗(治 'Conversation already has an active response'):
+                    # 再加 thinking(说完等回复中)+ turn_speaker_at<2s(刚有用户说话→服务端会自动起回复)双兜底。
                     with st.lock:
                         _do_greet = st.greet_now
                         if _do_greet:
                             st.greet_now = False
-                        _busy = st.in_flight > 0
+                        _busy = (st.in_flight > 0 or st.thinking
+                                 or (time.monotonic() - st.turn_speaker_at) < 2.0)
                     if _do_greet and not _busy and (time.monotonic() - greet_sent_at) > 1.0:
                         # 身份+记忆注入:首次识别到人后,用 update_session 嵌入记忆(切人时自动替换旧记忆)
                         with st.lock:
