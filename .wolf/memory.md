@@ -153,187 +153,21 @@
 | 21:40 | Edited voice/d01_realtime_chat.py | 6→6 lines | ~86 |
 | 21:40 | Edited voice/realtime.py | 4→5 lines | ~68 |
 | 21:41 | Session end: 17 writes across 6 files (realtime.py, d01_realtime_chat.py, PROJECT_STATE.md, state.py, debug_server.py) | 7 reads | ~62273 tok |
-| 21:44 | Session end: 17 writes across 6 files (realtime.py, d01_realtime_chat.py, PROJECT_STATE.md, state.py, debug_server.py) | 7 reads | ~62273 tok |
-| 10:33 | Session end: 17 writes across 6 files (realtime.py, d01_realtime_chat.py, PROJECT_STATE.md, state.py, debug_server.py) | 7 reads | ~62273 tok |
-| 10:36 | Session end: 17 writes across 6 files (realtime.py, d01_realtime_chat.py, PROJECT_STATE.md, state.py, debug_server.py) | 7 reads | ~62273 tok |
-| 10:41 | Created ../../../../.claude/plans/rustling-booping-biscuit.md | — | ~819 |
-| 10:44 | Session end: 18 writes across 7 files (realtime.py, d01_realtime_chat.py, PROJECT_STATE.md, state.py, debug_server.py) | 16 reads | ~73848 tok |
-
-## Session: 2026-06-26 10:50
-
-| Time | Action | File(s) | Outcome | ~Tokens |
-|------|--------|---------|---------|--------|
-
-## Session: 2026-06-26 11:08
-
-| Time | Action | File(s) | Outcome | ~Tokens |
-|------|--------|---------|---------|--------|
-
-## Session: 2026-06-26 11:10
-
-| Time | Action | File(s) | Outcome | ~Tokens |
-|------|--------|---------|---------|--------|
-
-## Session: 2026-06-26 11:34
-
-| Time | Action | File(s) | Outcome | ~Tokens |
-|------|--------|---------|---------|--------|
-| 11:39 | Edited memory/manager.py | 20→20 lines | ~176 |
-| 11:39 | Edited memory/manager.py | modified _migrate_legacy_facts() | ~576 |
-| 11:39 | Edited memory/manager.py | 27→24 lines | ~254 |
-| 11:40 | Edited memory/manager.py | inline fix | ~27 |
-| 11:40 | Edited memory/manager.py | modified get() | ~512 |
-| 11:40 | Edited memory/manager.py | modified save_fact() | ~369 |
-| 11:41 | Edited memory/manager.py | modified forget_fact() | ~343 |
-| 11:41 | Edited memory/manager.py | modified get_facts() | ~53 |
-| 11:41 | Edited memory/manager.py | modified consolidate_facts() | ~318 |
-| 11:41 | Edited memory/manager.py | modified get_prompt() | ~285 |
-| 11:41 | Edited memory/manager.py | list() → dict() | ~57 |
-| 11:42 | Edited memory/manager.py | modified merge_memories() | ~371 |
-| 11:42 | Edited memory/manager.py | modified isinstance() | ~238 |
-| 11:42 | Edited memory/manager.py | modified handle_tool_call() | ~204 |
-| 11:42 | Edited memory/manager.py | modified print() | ~156 |
-| 11:43 | Edited memory/manager.py | modified isinstance() | ~148 |
-| 11:43 | Edited voice/config.py | 7→10 lines | ~119 |
-| 11:44 | Edited voice/realtime.py | modified save_summary() | ~895 |
-| 11:45 | Edited docs/COGNITIVE_MEMORY_ARCHITECTURE.md | 13→15 lines | ~173 |
-| 11:45 | Edited docs/COGNITIVE_MEMORY_ARCHITECTURE.md | expanded (+14 lines) | ~131 |
-| 11:45 | Edited docs/COGNITIVE_MEMORY_ARCHITECTURE.md | 35→36 lines | ~211 |
-| 11:46 | Edited docs/COGNITIVE_MEMORY_ARCHITECTURE.md | 11→11 lines | ~64 |
-| 11:46 | Edited docs/COGNITIVE_MEMORY_ARCHITECTURE.md | modified save_summary() | ~231 |
-| 11:47 | Edited docs/COGNITIVE_MEMORY_ARCHITECTURE.md | 21→20 lines | ~175 |
-| 11:47 | Edited docs/COGNITIVE_MEMORY_ARCHITECTURE.md | 8→9 lines | ~99 |
-| 11:47 | Edited docs/COGNITIVE_MEMORY_ARCHITECTURE.md | 5→6 lines | ~100 |
-| 11:48 | Edited docs/FEATURE_INVENTORY.md | 21→21 lines | ~537 |
-| 11:49 | Edited PROJECT_STATE.md | expanded (+8 lines) | ~265 |
-| 11:49 | Edited PROJECT_STATE.md | 13→13 lines | ~103 |
-| 11:52 | Session end: 29 writes across 6 files (manager.py, config.py, realtime.py, COGNITIVE_MEMORY_ARCHITECTURE.md, FEATURE_INVENTORY.md) | 7 reads | ~33945 tok |
-| 14:48 | Session end: 29 writes across 6 files (manager.py, config.py, realtime.py, COGNITIVE_MEMORY_ARCHITECTURE.md, FEATURE_INVENTORY.md) | 9 reads | ~59016 tok |
-
-## Session: 2026-06-26 14:52
-
-| Time | Action | File(s) | Outcome | ~Tokens |
-|------|--------|---------|---------|--------|
-| 14:57 | Edited voice/realtime.py | modified if() | ~209 |
-| 14:58 | Edited voice/realtime.py | modified save_summary() | ~959 |
-| 15:00 | Edited voice/realtime.py | modified if() | ~172 |
-| 15:02 | Edited voice/d01_realtime_chat.py | 3→7 lines | ~107 |
-| 15:02 | Edited voice/d01_realtime_chat.py | 7→11 lines | ~154 |
-| 15:03 | Edited voice/realtime.py | modified save_summary() | ~922 |
-| 15:03 | Session end: 6 writes across 2 files (realtime.py, d01_realtime_chat.py) | 3 reads | ~27645 tok |
-| 15:13 | Session end: 6 writes across 2 files (realtime.py, d01_realtime_chat.py) | 3 reads | ~27645 tok |
-| 15:14 | Edited memory/manager.py | inline fix | ~23 |
-| 15:15 | Edited memory/manager.py | modified save_fact() | ~209 |
-| 15:15 | Edited memory/manager.py | modified forget_fact() | ~261 |
-| 15:16 | Edited memory/manager.py | modified consolidate_facts() | ~191 |
-| 15:17 | Edited memory/manager.py | modified clear_all() | ~300 |
-| 15:19 | Edited memory/manager.py | 6→6 lines | ~82 |
-
-## Session: 2026-06-26 15:20
-
-| Time | Action | File(s) | Outcome | ~Tokens |
-|------|--------|---------|---------|--------|
-| 15:21 | Edited memory/manager.py | added 1 import(s) | ~44 |
-| 15:23 | Edited memory/manager.py | modified load_memory() | ~664 |
-| 15:24 | Session end: 2 writes across 1 files (manager.py) | 1 reads | ~6751 tok |
-| 15:35 | Edited voice/state.py | modified _record_event() | ~909 |
-| 15:36 | Session end: 3 writes across 2 files (manager.py, state.py) | 5 reads | ~61121 tok |
-| 15:44 | Edited voice/realtime.py | modified open_session() | ~522 |
-| 15:44 | Edited voice/realtime.py | modified update_memory() | ~592 |
-| 15:45 | Edited voice/d01_realtime_chat.py | 29→32 lines | ~584 |
-| 15:45 | Edited voice/realtime.py | modified if() | ~262 |
-| 15:46 | Session end: 7 writes across 4 files (manager.py, state.py, realtime.py, d01_realtime_chat.py) | 5 reads | ~63163 tok |
-| 15:47 | Edited voice/realtime.py | 16→16 lines | ~272 |
-| 15:48 | Edited voice/realtime.py | 8→10 lines | ~181 |
-| 15:48 | Edited voice/realtime.py | 7→9 lines | ~184 |
-| 15:48 | Edited voice/realtime.py | 7→9 lines | ~183 |
-| 15:49 | Edited voice/realtime.py | 4→8 lines | ~146 |
-| 15:49 | Edited voice/realtime.py | 12→16 lines | ~260 |
-| 15:50 | Edited voice/realtime.py | 8→10 lines | ~171 |
-| 15:51 | Edited voice/realtime.py | modified finditer() | ~420 |
-| 15:51 | Edited voice/realtime.py | "🤖 模型调用工具: {name}" → "🤖 模型调用工具: {name}({_fc_ar" | ~17 |
-| 15:52 | Edited voice/d01_realtime_chat.py | 13→16 lines | ~216 |
-| 15:53 | Edited voice/state.py | 1→3 lines | ~25 |
-| 15:54 | Edited voice/state.py | 5→4 lines | ~32 |
-| 15:54 | Edited voice/state.py | 6→4 lines | ~67 |
-| 15:55 | Edited voice/state.py | modified __init__() | ~36 |
-| 16:09 | Edited voice/realtime.py | 4→4 lines | ~65 |
-| 16:10 | Session end: 22 writes across 4 files (manager.py, state.py, realtime.py, d01_realtime_chat.py) | 5 reads | ~66122 tok |
-| 16:24 | Session end: 22 writes across 4 files (manager.py, state.py, realtime.py, d01_realtime_chat.py) | 6 reads | ~67740 tok |
-| 16:26 | Session end: 22 writes across 4 files (manager.py, state.py, realtime.py, d01_realtime_chat.py) | 6 reads | ~67740 tok |
-| 16:42 | Edited voice/d01_realtime_chat.py | 11→12 lines | ~172 |
-| 16:43 | Edited voice/d01_realtime_chat.py | 7→8 lines | ~126 |
-| 16:45 | Session end: 24 writes across 4 files (manager.py, state.py, realtime.py, d01_realtime_chat.py) | 8 reads | ~74375 tok |
-
-## Session: 2026-06-26 16:50
-
-| Time | Action | File(s) | Outcome | ~Tokens |
-|------|--------|---------|---------|--------|
-| 16:55 | 分析face_db交叉相似度 | data/face_db.json | 大大<->坤坤 max=0.784确认同人 | ~800 |
-| 16:56 | 合并face embeddings(FPS选15个) | data/face_db.json | 坤坤删除,大大15emb,跨组max=0.323 | ~600 |
-| 16:57 | 合并坤坤记忆到大大 | data/memories/ | 7facts+13episodes,坤坤mem已删 | ~400 |
-| 17:03 | Edited voice/realtime.py | modified _record_tool_output() | ~195 |
-| 17:04 | Edited voice/realtime.py | 7→8 lines | ~174 |
-| 17:04 | Edited voice/realtime.py | 7→8 lines | ~173 |
-| 17:04 | Edited voice/realtime.py | 7→8 lines | ~180 |
-| 17:05 | Edited voice/realtime.py | 7→8 lines | ~181 |
-| 17:05 | Edited voice/realtime.py | 8→9 lines | ~179 |
-| 17:06 | Edited voice/d01_realtime_chat.py | inline fix | ~18 |
-| 17:06 | Edited voice/d01_realtime_chat.py | 6→7 lines | ~134 |
-| 17:06 | Edited voice/debug_server.py | added 1 condition(s) | ~809 |
-| 17:07 | Edited voice/debug_server.py | added 1 condition(s) | ~88 |
-| 17:08 | Session end: 10 writes across 3 files (realtime.py, d01_realtime_chat.py, debug_server.py) | 5 reads | ~53617 tok |
-| 17:18 | Session end: 10 writes across 3 files (realtime.py, d01_realtime_chat.py, debug_server.py) | 6 reads | ~53617 tok |
-
-## Session: 2026-06-26 17:33
-
-| Time | Action | File(s) | Outcome | ~Tokens |
-|------|--------|---------|---------|--------|
-| 17:39 | Edited voice/d01_realtime_chat.py | 3→4 lines | ~65 |
-| 17:40 | Edited voice/d01_realtime_chat.py | expanded (+7 lines) | ~177 |
-| 17:40 | Edited voice/state.py | 2→3 lines | ~42 |
-| 17:41 | Edited voice/d01_realtime_chat.py | 4→7 lines | ~134 |
-| 17:41 | Edited voice/realtime.py | modified restart_session_for_switch() | ~413 |
-| 17:41 | Edited voice/d01_realtime_chat.py | expanded (+7 lines) | ~354 |
-| 17:42 | Edited voice/config.py | 10→12 lines | ~146 |
-| 17:43 | Edited voice/realtime.py | expanded (+7 lines) | ~145 |
-| 17:43 | Edited voice/realtime.py | 1→5 lines | ~83 |
-| 17:43 | Created data/memories/person_f4e8c43f.json | — | ~20 |
-| 17:47 | Created docs/QWEN_OMNI_TOOL_CALLING.md | — | ~920 |
-| 17:48 | Created PROJECT_STATE.md | — | ~868 |
-| 17:48 | Edited voice/realtime.py | reduced (-7 lines) | ~79 |
-| 17:49 | Edited voice/realtime.py | removed 5 lines | ~20 |
-| 17:49 | Edited docs/QWEN_OMNI_TOOL_CALLING.md | 修正6.2节(去掉BROAD_TAG_RE推荐) | ~120 |
-| 17:50 | 综合修复总结 | d01/realtime/config/state/memories | 4项修复完成 | ~500 |
-| 17:49 | Edited docs/QWEN_OMNI_TOOL_CALLING.md | 17→19 lines | ~124 |
-| 17:52 | Edited voice/d01_realtime_chat.py | removed 18 lines | ~22 |
-| 17:53 | Edited voice/d01_realtime_chat.py | modified is_set() | ~19 |
-| 17:53 | Session end: 17 writes across 7 files (d01_realtime_chat.py, state.py, realtime.py, config.py, person_f4e8c43f.json) | 9 reads | ~52848 tok |
-| 17:54 | Edited docs/QWEN_OMNI_TOOL_CALLING.md | expanded (+40 lines) | ~303 |
-| 17:55 | Session end: 18 writes across 7 files (d01_realtime_chat.py, state.py, realtime.py, config.py, person_f4e8c43f.json) | 9 reads | ~53172 tok |
-| 18:37 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 4 reads | ~53956 tok |
-| 18:41 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 4 reads | ~53956 tok |
-| 19:08 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 4 reads | ~53956 tok |
-| 09:59 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 4 reads | ~53956 tok |
-| 10:07 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 6 reads | ~53956 tok |
-| 10:09 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 6 reads | ~53956 tok |
-| 10:12 | Session end: 11 writes across 2 files (recognizer.py, recapture_face.py) | 6 reads | ~53956 tok |
-
-## Session: 2026-06-27 10:20
-
-| Time | Action | File(s) | Outcome | ~Tokens |
-|------|--------|---------|---------|--------|
-| 10:55 | Edited voice/config.py | reduced (-23 lines) | ~124 |
-| 10:55 | Session end: 1 writes across 1 files (config.py) | 6 reads | ~44687 tok |
-| 10:59 | Session end: 1 writes across 1 files (config.py) | 6 reads | ~44687 tok |
-| 11:19 | Session end: 1 writes across 1 files (config.py) | 6 reads | ~44687 tok |
-| 11:21 | Edited voice/realtime.py | expanded (+6 lines) | ~55 |
-| 11:21 | Edited voice/realtime.py | removed 7 lines | ~10 |
-| 11:22 | Session end: 3 writes across 2 files (config.py, realtime.py) | 6 reads | ~45011 tok |
-
-## Session: 2026-06-27 11:24
-
-| Time | Action | File(s) | Outcome | ~Tokens |
-|------|--------|---------|---------|--------|
-| 11:28 | Edited ../../../../Library/Application Support/Code/User/settings.json | 2→3 lines | ~22 |
-| 11:28 | Session end: 1 writes across 1 files (settings.json) | 0 reads | ~22 tok |
+| 11:30 | 记忆归属统一(turn_speaker)+每轮工具审视兜底抽取(qwen-plus,5轮上下文) | voice/realtime.py, d01, state.py, config.py | bug-056 修复;py_compile 绿,待实机验证 | ~45k |
+| 13:30 | 头部转向平滑(二级EMA+黏滞+DOA保持,与归属解耦)+绿框新鲜度门+去蓝框+手改青+2位小数 | d01, asd.py, debug_server.py, config.py | bug-057;py_compile绿,待实机验证 | ~40k |
+| 15:30 | 头部/当前人改按身份(person_id)黏滞抗churn(治无人说话头晃+归属对叫错人thrash);realtime不再写current_person_id | d01, realtime.py, config.py | bug-057迭代+bug-058;py_compile绿,待实测 | ~38k |
+| 16:10 | DOA瞟头(TRACKING:侧面喊+画面无人说话→朝声源符号侧瞟≤15°找人,只动头;视觉/ASD锁到接管) | d01, config.py | 治'喊他不转';py_compile绿,待实测 | ~22k |
+| 16:30 | fps螺旋断路器(fps<8冻结身体跟随+瞟头,断churn死循环)+ resp_snapshot画外→None(画外不存给在场人) | d01, realtime.py, config.py | bug-059;数据由用户全清;py_compile绿,待实测 | ~30k |
+| 17:30 | #2注入只认turn_speaker(去焦点驱动)+#4 ASD按身份键聚合(治新人画外)+#1 DOA角度转头(封顶+身体跟随面对) | d01, realtime.py, asd.py, config.py | bug-060;#3同脸合并暂缓;py_compile绿,待实测 | ~55k |
+| 18:10 | 画外/未识别注入中性上下文(治问'我是谁'答陛下)+模型回复入log(💬小艺)+MJPEG断流静默 | realtime.py, debug_server.py | bug-061;py_compile绿,待测 | ~18k |
+| 18:40 | DOA转头重写为状态机:转到声源角度(上限75,转身放开fps冻结)→停那等说话→锁说话人→找不到不弹回原脸+冷却防来回转 | d01, config.py | 按用户逻辑;py_compile绿,待测 | ~25k |
+| 19:05 | DOA转头加'真说话'闸(user_speaking最近1.5s内才转,滤环境音)治无声慢慢左漂 | d01, config.py | py_compile绿,待测 | ~12k |
+| 19:30 | churn治本:ByteTracker Stage3 lost找回加IoU(方案B无embedding纯IoU/有则embedding),匈牙利;对照asd-demo webcam印证 | perception/face_tracker.py, tests | bug-062;27单测绿,待实测 | ~40k |
+| 10:10 | 决策:churn 治理保留 Stage3 IoU 召回(用户拍板,优于 ArcFace 重认,track_id+身份双不变 ASD 无缝) | .wolf/cerebrum.md | 已记决策日志,单测 21/21 绿 | ~1.5k |
+| 11:40 | 真机测试 churn 修复:2人+DOA fps稳14~18(修前崩2.4)、ArcFace身份召回正常→验证通过;发现 bug-063 画内未命名身份占位名?T4漏进模型回复 | (测试) .wolf/buglog.json | bug-062 validated + bug-063 已记(待修) | ~6k |
+| 12:30 | 命名/身份修复 CP1-5:占位名不进模型+画外不命名+命名guard(来自转写/不静默改名)+显示名实时取 | voice/realtime.py voice/d01_realtime_chat.py | py_compile 过;bug-063修复+bug-064/065新增;待真机测 | ~12k |
+| 13:30 | DOA瞟头修复 F1+F4:本地麦响度绕开门控触发+按符号转固定大角(治侧边喊不转/转不够) | voice/d01_realtime_chat.py config.py state.py | py_compile过;bug-066;待真机验+调GLANCE_LOCAL_RMS | ~8k |
+| 15:30 | 二次唤醒A方案:对话中喊小艺→打断+天线heard+转DOA找喊话人,保留会话(去掉close/reopen) | voice/d01_realtime_chat.py | py_compile过;须不带--no-wake启动;待真机测 | ~5k |
+| 15:35 | 二次唤醒A方案真机验证通过:5次对话中喊小艺全触发打断+转向找喊话人(4粗方向+1confident),保留会话 | PROJECT_STATE.md | 验证通过;DOA多为粗方向(近似) | ~3k |
+| 15:50 | 修 bug-067: 二次唤醒后用户接话→招呼create_response撞semantic_vad自动回复(active response报错);守卫加thinking+turn_speaker_at<2s | voice/d01_realtime_chat.py | py_compile过 | ~3k |
+| 17:40 | codegraph 全工程分析:建索引(56文件/1339节点)+ 量化结构热点(god函数/77字段State单锁/重复定义/吞异常) | d01/state/actions | 产出优化清单待审 | ~9k |

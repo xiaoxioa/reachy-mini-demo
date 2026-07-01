@@ -16,15 +16,20 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL = os.environ.get("REALTIME_MODEL", "qwen3.5-omni-plus-realtime")
 VISION_MODEL = os.environ.get("VISION_MODEL", "qwen3.5-omni-plus")
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "qwen-turbo")
+EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "qwen-plus")  # 每轮工具审视(记忆抽取),FC/判断更稳
 VISION_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 VOICE = "Ethan"
 INSTRUCTIONS = (
     "你是桌面机器人,名字叫'小艺'(用户给你起的中文名),有真实的身体(头、天线)和一台摄像头。"
     "别人问你叫什么、喊'小艺'时,你都以小艺自居;不要自称 Reachy Mini(那只是你的硬件型号)。"
     "用简体中文、口语化、简短地回答,一般不超过两三句话。"
-    "你有很多工具可以使用,回答时积极配合工具表达身体语言和执行操作。"
-    "做动作时必须同时用语音回应,边说边做;绝不要默默做动作不说话。"
-    "需要表达情绪时用语气和措辞,比如开心就用活泼的话,难过就用低沉的话。"
+    "回答时自然地配合动作工具表达身体语言:打招呼/同意时点头,否定时摇头,"
+    "开心/兴奋/被夸时摆天线,好奇/疑惑时歪头。"
+    "重要:做动作时必须同时用语音回应,边说边做;绝不要默默做动作不说话。"
+    "你的摄像头画面会持续实时提供给你(每秒约一帧),你一直能看见眼前的场景。"
+    "用户让你看东西、问'你看到了什么''我手里拿的是什么''我比的是什么手势''这是什么''那边有什么'等"
+    "视觉问题时,直接参考你最近看到的画面,用自己的话自然地说出来,不需要调用任何工具。"
+    "若目标在当前画面外(比如让你看某个方向),可先用 look_left/right/up/down 转头,转过去后画面会随之更新,再看再答。"
     "【最重要的规则——你的文字会被语音合成直接朗读给用户听】"
     "你的文字输出只能包含你要说的话。"
     "禁止在文字中写任何动作描述、情绪标注、舞台指示——包括括号、尖括号、星号等任何形式。"
@@ -68,6 +73,21 @@ FOV_Y_DEG = 40.0
 TRACK_TAU = 0.40
 TRACK_DEADBAND = 2.0
 TRACK_MAX_STEP = 1.5
+# 头部"看谁"平滑(只影响头部转向+焦点,不动 ASD 归属判断/参数):引擎 EMA 上再叠重 EMA + 身份黏滞
+HEAD_ASD_EMA = 0.18          # 头部专用二级 EMA(越小越平滑,比引擎 0.5 更平滑)
+HEAD_SPK_ON = 0.20          # 平滑分 > 此值才算"该看的说话人"(才考虑切头)
+HEAD_SWITCH_MARGIN = 0.50   # 切到新人需比当前人平滑分高出此余量(防两人间来回甩);否则黏在当前人直到其离场
+# DOA 瞟头(TRACKING 态:侧面有人喊但画面里没人在说话 → 朝声源侧瞟一眼找人;只用 resid 符号,不信角度——见 CALIBRATION §14)
+DOA_GLANCE_DEG = 20.0       # 声源偏离(身体系)> 此角度才触发转头找人;转到 ≤此即视为已面向、停转
+GLANCE_MAX_DEG = 75.0       # 转头最大偏移:朝 DOA 角度转身找人(resid 是身体系,必须转身体才减小);封顶防转飞
+GLANCE_MIN_HOLD_S = 0.3     # DOA 偏离需持续此时长才转(防瞬时误报)
+GLANCE_TIMEOUT_S = 5.0      # 转身找人最长时间;超时未找到(可能 DOA 镜像错)→ 停 + 冷却
+GLANCE_COOLDOWN_S = 3.0     # 超时后冷却,避免对着错方向反复转
+GLANCE_SPEECH_GRACE_S = 1.5 # 转头触发必须"最近有人真说话"在此窗口内;否则纯环境音/DOA幻觉不转(治无声左漂)
+GLANCE_MIN_TURN_DEG = 50.0  # F4:DOA 角度不可信(只信符号)→ 朝符号方向至少转这么多,把宽角度的人转进视野(治"转向不够");上限仍是 GLANCE_MAX_DEG
+GLANCE_LOCAL_RMS = 0.006    # F1:本地麦克风(门控前)响度超此值即算"有人在说话",喂给瞟头触发,绕开方向门控对>55°声音的静音死锁。麦增益低可调小(正常说话约0.003)
+FPS_FREEZE_BELOW = 8.0      # 检测 fps(EMA)低于此值→冻结身体跟随/瞟头,断"相机甩→churn→fps更低"死循环
+ASD_MAX_TRACKS = 3          # ASD 每帧最多喂最大的 N 个 track(churn 出一堆 ghost 时逐个裁剪+打分会拖垮 CPU/GPU→fps崩)
 TRACK_YAW_LIMIT = 25.0
 TRACK_PITCH_LIMIT = 15.0
 LOST_HOLD_S = 1.5
@@ -225,13 +245,13 @@ BASE_TOOLS = [
     {"type": "function", "name": "shake_head",
      "description": "摇头。否定、拒绝、不同意、说'不'时使用。", "parameters": _NOPARAM},
     {"type": "function", "name": "look_left",
-     "description": "把头转向左边(仅肢体动作,不拍照不看东西)。要看左边是什么请先look_left再take_snapshot。", "parameters": _NOPARAM},
+     "description": "把头转向左边。转过去后摄像头画面会更新,就能看到左边有什么。", "parameters": _NOPARAM},
     {"type": "function", "name": "look_right",
-     "description": "把头转向右边(仅肢体动作,不拍照不看东西)。要看右边是什么请先look_right再take_snapshot。", "parameters": _NOPARAM},
+     "description": "把头转向右边。转过去后摄像头画面会更新,就能看到右边有什么。", "parameters": _NOPARAM},
     {"type": "function", "name": "look_up",
-     "description": "抬头看上方(仅肢体动作,不拍照不看东西)。要看上面是什么请先look_up再take_snapshot。", "parameters": _NOPARAM},
+     "description": "抬头转向上方。转过去后摄像头画面会更新,就能看到上面有什么。", "parameters": _NOPARAM},
     {"type": "function", "name": "look_down",
-     "description": "低头看下方(仅肢体动作,不拍照不看东西)。要看下面是什么请先look_down再take_snapshot。", "parameters": _NOPARAM},
+     "description": "低头转向下方。转过去后摄像头画面会更新,就能看到下面有什么。", "parameters": _NOPARAM},
     {"type": "function", "name": "wiggle_antennas",
      "description": "欢快地摆动头顶天线。表达开心、兴奋、被夸奖、热情时使用。", "parameters": _NOPARAM},
     {"type": "function", "name": "tilt_head",
@@ -242,13 +262,8 @@ BASE_TOOLS = [
                     "⚠️ 注意:「再说吧」「这个先放一边」「等会儿」「待会聊」「先放着」「回头说」等只是话题搁置或语气词,"
                     "【不是】结束对话,绝不要因此调用;拿不准时继续对话、不要调。",
      "parameters": _NOPARAM},
-    {"type": "function", "name": "take_snapshot",
-     "description": "用摄像头拍一张当前画面并理解内容。当用户让你看东西、问'你看到什么''我手里是什么'等需要视觉、但不涉及'指向'的问题时调用。",
-     "parameters": _NOPARAM},
-    {"type": "function", "name": "identify_pointed_object",
-     "description": "当用户在用手指指方向或指物体时调用——包括'这是什么''我指的是什么''看看那边''那里有什么'等。"
-                    "会自动判断指向方向,需要时转头去看,然后拍照理解目标。优先于 look_left/right + take_snapshot 组合。",
-     "parameters": _NOPARAM},
+    # take_snapshot / identify_pointed_object 已移除:改为实时视频流(append_video, 1fps)
+    # 直接喂模型,模型一直能看见画面,被问视觉问题直接答,无需工具往返。
 ]
 
 # ── 看图 prompt ──
