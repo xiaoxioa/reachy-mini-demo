@@ -288,6 +288,58 @@
 
 ---
 
+### F24 — 注视感知(Gaze-Aware Interaction, Phase 1)
+
+**状态**: 已实现(观测层), 待真机验证
+**分支**: `feat/gaze-aware-interaction`
+
+三级级联估计在场人是否在看机器人:
+- **L0**: 5点 landmarks 几何头姿(yaw/pitch), 0.02ms, 过滤大角度侧脸
+- **L1**: 时间降频, NOT_LOOKING track 每 5 帧才跑 L2, 减少 ONNX 调用
+- **L2**: L2CS-Net MobileNetV2 ONNX (448×448), ~35ms/face macOS Intel CPU, 输出 gaze yaw/pitch
+- **Mutual gaze 判定**: |gaze_yaw| < 12° AND |gaze_pitch| < 15°
+
+注视行为状态机(GazeBehaviorFSM) 4 态:
+- **IDLE**: 无人 → 自主探索动画(未接入)
+- **CURIOUS_LOOK**: 1 人看我 → 好奇注视(输出 target_track_id)
+- **SCANNING**: 多人看我 → 视线扫过(轮换 scan_targets)
+- **GLANCING**: 有人但没看我 → 偶尔瞥最近的人
+
+| 子特性 | 代码位置 | 说明 |
+|--------|----------|------|
+| F24.1 L0 头姿预过滤 | `perception/gaze.py:HeadPoseFilter` | 5 点几何 yaw/pitch, 阈值 45°/35° |
+| F24.2 L1 时间降频 | `perception/gaze.py:GazeModule._TrackGazeState` | per-track 帧计数, 降频 5x |
+| F24.3 L2 ONNX 推理 | `perception/gaze.py:GazeEstimator` | L2CS-Net 448×448, softmax + weighted sum |
+| F24.4 行为 FSM | `perception/gaze_behavior.py:GazeBehaviorFSM` | IDLE/CURIOUS/SCANNING/GLANCING |
+| F24.5 Pipeline 集成 | `perception/face_pipeline.py:process()` | TrackView 增 gaze 字段 |
+| F24.6 状态写入 | `voice/d01_realtime_chat.py:vision_result_loop` | st.gaze_behavior + debug |
+| F24.7 优雅降级 | `perception/gaze.py:GazeModule` | 模型缺失 → available=False, 只跑 L0 |
+
+**依赖**: `models/l2csnet_mobilenetv2.onnx` (9.3MB, gitignored, 需从 yakhyo/gaze-estimation releases 下载)
+
+### F25 — ARMED 注视回看(Gaze-Aware Interaction, Phase 2)
+
+**状态**: 已实现, 待真机验证
+**分支**: `feat/gaze-aware-interaction`
+
+ARMED 待命态下，有人看机器人(CURIOUS_LOOK/SCANNING) → 机器人缓慢好奇地回看对方。
+
+| 子特性 | 代码位置 | 说明 |
+|--------|----------|------|
+| F25.1 目标 u,v 存储 | `d01:vision_result_loop` gaze FSM 更新块 | FSM 输出 target_track_id → 查 TrackView 的 u,v → 存入 st.gaze_target_u/v |
+| F25.2 指数时间常数积分 | `d01:vision_result_loop` ARMED 积分分支 | `k = 1 - exp(-dt / τ)`, τ=0.80s(TRACKING 用 0.40s，慢一倍), 经 OneEuroFilter 平滑后写 st.track_yaw/pitch |
+| F25.3 入场延迟防抖 | `d01:vision_result_loop` _gaze_armed_since | CURIOUS_LOOK/SCANNING 连续 ≥0.5s 才激活积分, 滤掉 mutual_gaze 闪烁 |
+| F25.4 大 deadband | `config.py:GAZE_ARMED_DEADBAND` | err < 3° 不动(TRACKING 用 2°), 防微小抖动 |
+| F25.5 慢 max_step | `config.py:GAZE_ARMED_MAX_STEP` | 每帧最大 1.2°(TRACKING 用 1.5°), 保持好奇感 |
+| F25.6 只转头不转身 | 设计约束 | ARMED 下不驱动身体跟随, 保持待命低调感 |
+| F25.7 退出回正 | `d01:behavior_loop` ARMED 段 | gaze→IDLE/GLANCING 时 behavior_loop 恢复 approach(0,0,0), 头匀速回正 |
+| F25.8 单写者保护 | `d01:behavior_loop` ARMED 段 | gaze active(CURIOUS_LOOK/SCANNING)时 behavior_loop 跳过 approach(), 避免与 vision_result_loop 竞态写 track_yaw |
+
+**用法**: 无需操作, ARMED 状态下有人正视机器人 → 0.5s 后机器人头缓慢转向注视者; 注视者看走 → 头匀速回正
+**参数**: `GAZE_ARMED_TAU`(τ, 越大越慢), `GAZE_ARMED_MAX_STEP`(步进上限), `GAZE_ARMED_DEADBAND`(死区), `GAZE_ARMED_ENTRY_S`(入场延迟)
+
+---
+
 ## 二、测试方案
 
 ### 测试分层

@@ -2,6 +2,49 @@
 
 ## 已完成事项
 
+### ✅ 注视感知 Phase 2 — ARMED 注视回看 + 时间常数平滑 + Dashboard 可视化(2026-07-02)
+
+**Phase 2a: Dashboard 可视化**
+- `debug_server.py`: mutual_gaze 框色(说话绿>注视青>普通灰) + 底部 gaze 标签(LOOK / Y:+5 P:-3) + 注视方向箭头 + 左上角 `gaze=CURIOUS_LOOK →T42` 行
+- 注册面板(#reg-panel)改为可关闭(✕)+可拖动(标题栏)+重开按钮(🏷)
+
+**Phase 2b: ARMED 注视回看**
+- 有人看机器人(CURIOUS_LOOK/SCANNING)→ 机器人在 ARMED 下缓慢回看对方
+- 积分机制: 指数时间常数 τ=0.80s(TRACKING 用 0.40s,这里慢一倍) + OneEuroFilter 平滑
+- 防抖: 入场延迟 0.5s + deadband 3° + max_step 1.2°/帧 + 不驱动身体
+- 退出: gaze→IDLE/GLANCING 时 behavior_loop 恢复 approach(0,0,0) 回正
+
+**修改文件**:
+- `voice/state.py`: +gaze_target_u/v 字段
+- `voice/config.py`: +GAZE_ARMED_TAU/MAX_STEP/DEADBAND/ENTRY_S 常量
+- `voice/d01_realtime_chat.py`: gaze FSM 存 target u,v + vision_result_loop ARMED 积分分支 + behavior_loop 条件 approach
+- `voice/debug_server.py`: 可视化 + 面板交互
+
+### ✅ 注视感知 Phase 1 — 三级级联 Gaze Estimation(2026-06-29，feat/gaze-aware-interaction 分支）
+
+在场人是否在看机器人 + 注视行为状态机，为后续"好奇回看"交互打基础。
+
+**架构**：L0(5点几何头姿,0.02ms) → L1(时间降频,NOT_LOOKING 5帧1次) → L2(L2CS-Net MobileNetV2 ONNX 448×448,~35ms/face macOS Intel CPU)
+
+**新增文件**：
+- `perception/gaze.py` — GazeResult/HeadPoseFilter(L0)/GazeEstimator(L2)/GazeModule 级联管理器
+- `perception/gaze_behavior.py` — GazeBehaviorFSM(IDLE/CURIOUS_LOOK/SCANNING/GLANCING)
+- `scripts/benchmark_gaze.py` — CPU latency benchmark(p50/p95/p99）
+
+**修改文件**：
+- `voice/config.py` — 注视估计常量段(阈值/FSM参数)
+- `perception/face_pipeline.py` — TrackView 增 gaze 字段 + process() 内级联调用 + _view() gaze 填充
+- `voice/state.py` — st.gaze_behavior/gaze_target_id
+- `voice/d01_realtime_chat.py` — GazeModule 初始化注入 + FSM 接线 + debug 字段
+
+**关键设计**：
+- GazeModule 注入 `_face_pipeline._gaze`（最小侵入，不改 __init__ 签名）
+- 模型缺失 → available=False，只跑 L0 头姿，不崩溃
+- Phase 1 仅观测：FSM 结果写 st + debug，不覆盖现有 ASD 头部跟随
+- 模型权重：`models/l2csnet_mobilenetv2.onnx`（9.3MB,gitignored,需手动下载或 scripts 自动拉取）
+
+**验证**：py_compile 6/6 绿 + 无模型优雅降级测试通过 + benchmark L0=0.02ms L2=35ms p50 + TrackView 向后兼容
+
 ### track churn 治本(2026-06-27,bug-062)—— 当前一切乱象的总根
 - **根因**:ByteTracker Stage3(lost track 找回)只用 embedding ReID;方案B 跟踪检测无 embedding → `embedding_distance` 全 1.0 → lost 永远找不回 → 漏检一帧就新建 track(稳定画面 ~8个/分钟,崩溃期飙到 84)→ ASD 逐 track 负载爆 → fps 崩 1.0fps。
 - **对照** asd-demo `webcam_asd_demo.py`(run_webcam_asd.bat)的朴素 IoU 跟踪:漏检 miss+1、留池、下帧 IoU 重匹配 → 不 churn。印证差在"lost 找回纯 embedding"。
@@ -187,7 +230,8 @@ memory/
 
 ## 下一步建议
 
-1. 真机测试验证身份稳定性修复 + 上下文防污染效果
-2. 继续 todo.md 未完成项
-3. end_session 工具 description 继续扩充正例触发词
-4. Semantic Memory 层 — 从 episodes 抽象知识 + GraphDB
+1. **真机验证 Phase 2 注视回看**：`VIS_DEBUG=1 bash start_mac.sh`，ARMED 下看机器人→头缓慢转向，看走→回正
+2. Phase 3：TRACKING 态注视增强（对话中持续微调头部追踪说话人视线）
+3. 真机测试验证身份稳定性修复 + 上下文防污染效果
+4. 继续 todo.md 未完成项(#1 DOA / #7 身份优化 / #9 对话质量)
+5. Semantic Memory 层 — 从 episodes 抽象知识 + GraphDB
