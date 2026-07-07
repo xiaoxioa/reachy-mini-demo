@@ -2,6 +2,17 @@
 
 ## 已完成事项
 
+### 🔧 多人张冠李戴修复(2026-07-06,bug-069/070,PR #16,分支 pr14-on-main,⚠️ 待真机验证)
+- **现象**:多人在场,新人/换人问"我是谁/我叫什么/我喜欢吃什么" → 模型答成另一个人(碧霞被答"你叫大大")。
+- **诊断**:归属层(ASD)+注入层内容都对,但 ① 共享会话历史污染 ② semantic_vad 在 speech_stopped 抢跑,注入慢一拍 ③ create_item 的 system 条目被 Qwen Omni 忽略。**时序确认过是主因之一,单靠 create_item 治不了。**
+- **修复(voice/realtime.py)**:
+  - `inject_context()`:当前说话人身份/记忆走 **create_item** 注入对话流(3 分支:已命名/在场未命名/画外),替代 update_session 弱信号;每轮刷新治 injected=False。
+  - **收回 turn-taking**:3 处会话配置 `turn_detection_param={"create_response":False}` + 注入后我方手动 create_response(in_flight==0 守卫)治抢跑。
+  - `resp_directive()`(**Option D**):`response.instructions` 给单次回复下"当前说话人"强指令(普通轮 + 工具轮都带),比 system 条目强,治其被忽略。
+  - 过滤 称呼/名字 类 fact 防和身份名打架(治"碧霞→陛下");fix 兜底抽取器 save_fact 缺参 TypeError(bug-069)。
+- **后手(若 D 不够)**:Option C —— 身份切换重启会话清历史(`restart_session_for_switch` 现为死代码,需接线 + 去抖触发)。
+- **测试重点**:张冠李戴改善程度、无哑火/双答、人设不丢。
+
 ### ✅ 注视感知 Phase 2 — ARMED 注视回看 + 时间常数平滑 + Dashboard 可视化(2026-07-02)
 
 **Phase 2a: Dashboard 可视化**
