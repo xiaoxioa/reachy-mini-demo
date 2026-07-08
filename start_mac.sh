@@ -172,13 +172,12 @@ if [ "${VIS_DEBUG:-0}" = "1" ]; then
 fi
 echo ""
 
-# ── 7. 实时跟进日志（Ctrl+C 或退出时停主程序 + daemon）──────────────
+# ── 7. 实时跟进日志（Ctrl+C 退出时只停主程序，daemon 保持运行）──────────────
 _cleanup() {
   echo ""
-  info "正在停止..."
+  info "正在停止主程序（daemon 保持运行）..."
   [ -f "$MAIN_PID" ] && kill "$(cat "$MAIN_PID")" 2>/dev/null && info "主程序已停止"
-  sleep 1
-  [ -f "$DAEMON_PID" ] && kill "$(cat "$DAEMON_PID")" 2>/dev/null && info "Daemon 已停止 (机器人将进入睡眠)"
+  info "Daemon 仍在运行，如需停止请执行: bash $0 stop"
 }
 trap '_cleanup; exit 0' INT
 trap '_cleanup' EXIT
