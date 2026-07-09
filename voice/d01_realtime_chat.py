@@ -94,7 +94,7 @@ from reachy_mini import ReachyMini
 # MediaPipe 不在主进程导入(TRACK-FIX):检测在 vision_worker 子进程跑,独立 GIL。
 from perception.vision_worker import vision_worker as _vision_worker_fn
 
-from identity.recognizer import IdentityRecognizer, IDENTITY_COOLDOWN_S
+from identity.recognizer import ArcFaceONNX, _align_face, _crop_face, IDENTITY_COOLDOWN_S
 from identity.owner import OwnerManager
 from memory.manager import MemoryManager
 from perception.face_pipeline import FaceReIDPipeline
@@ -170,7 +170,7 @@ from voice.state import (                           # ← 共享状态 + 日志 
 )
 import voice.state as _st_mod
 
-_id_recognizer: IdentityRecognizer | None = None
+_arcface: ArcFaceONNX | None = None
 _memory_mgr: MemoryManager | None = None
 _owner_mgr: OwnerManager | None = None
 _face_pipeline = None   # FaceReIDPipeline(ByteTrack + 三区间);main() 初始化
@@ -542,10 +542,9 @@ def _roi_redetect_kps(detector, full_rgb, box_xywh):
         return None
 
 
-def _make_face_embedder(rec, roi_detector=None):
+def _make_face_embedder(arcface, roi_detector=None):
     """给 FaceReIDPipeline 注入 ArcFace 提特征器:全分辨率帧 → (ROI 重检 sharp kps 优先,
     否则跟踪粗 kps)→ 5点对齐 → 512d L2。方案B:识别精度不受跟踪降采样影响。"""
-    from identity.recognizer import _align_face, _crop_face
 
     def _embed(full_rgb, box_xywh, kps):
         try:
@@ -555,7 +554,7 @@ def _make_face_embedder(rec, roi_detector=None):
                 aligned = _align_face(full_rgb, use_kps)
             else:
                 aligned = _crop_face(full_rgb, box_xywh)
-            return rec.arcface.get_embedding(aligned)
+            return arcface.get_embedding(aligned)
         except Exception:
             return None
     return _embed
@@ -2115,14 +2114,16 @@ def main() -> int:
     st.no_expression = no_expression
     st.no_memory = no_memory
 
-    global _id_recognizer, _memory_mgr, _owner_mgr, _face_pipeline, _asd_engine
+    global _arcface, _memory_mgr, _owner_mgr, _face_pipeline, _asd_engine
     _owner_mgr = OwnerManager()
-    _id_recognizer = IdentityRecognizer()
-    _memory_mgr = MemoryManager(owner_mgr=_owner_mgr,
-                                 face_db=_id_recognizer.db)
-    _roi_detector = _make_roi_detector()   # 方案B:识别走全分辨率 ROI 重检
-    _face_pipeline = FaceReIDPipeline(_make_face_embedder(_id_recognizer, _roi_detector),
+    _arcface = ArcFaceONNX()
+    _roi_detector = _make_roi_detector()
+    _face_pipeline = FaceReIDPipeline(_make_face_embedder(_arcface, _roi_detector),
                                       FaceSystemConfig(), log_fn=log)
+    _n_gal = _face_pipeline.load_gallery()
+    log(f"🧬 ReID pipeline 就绪(ByteTrack + 三区间, gallery {_n_gal} 人)")
+    _memory_mgr = MemoryManager(owner_mgr=_owner_mgr,
+                                 identity_store=_face_pipeline.store)
     _n_gal = _face_pipeline.load_gallery()
     log(f"🧬 ReID pipeline 就绪(ByteTrack + 三区间, gallery {_n_gal} 人)")
     _asd_engine = AsdEngine()           # LR-ASD 谁在说话(独立评分线程)
@@ -2160,11 +2161,13 @@ def main() -> int:
         scan_period_s=GAZE_SCAN_PERIOD_S,
         glance_interval_s=GAZE_GLANCE_INTERVAL_S,
     )
-    if _id_recognizer.startup_merged:
-        for drop_pid, keep_pid in _id_recognizer.startup_merged.items():
+    _startup_merged = _face_pipeline.store.auto_merge()
+    if _startup_merged:
+        for drop_pid, keep_pid in _startup_merged.items():
             _memory_mgr.merge_memories(keep_pid, drop_pid)
-        log(f"🧠 记忆合并完成: {len(_id_recognizer.startup_merged)} 对")
-    log(f"🆔 身份识别就绪 (特征库 {len(_id_recognizer.db.persons)} 人)")
+        _face_pipeline.save_gallery()
+        log(f"🧠 记忆合并完成: {len(_startup_merged)} 对")
+    log(f"🆔 身份识别就绪 (特征库 {len(_face_pipeline.store.identities)} 人)")
     play_q: "queue.Queue" = queue.Queue()
     motion_q: "queue.Queue" = queue.Queue()
     snap_q: "queue.Queue" = queue.Queue()
@@ -2231,8 +2234,10 @@ def main() -> int:
                 registry = registry.exclude(*_MEMORY_TOOL_NAMES)
 
             dialog = RealtimeDialog(st, play_q, motion_q, snap_q, mini,
-                                     oai, _memory_mgr, _owner_mgr, _id_recognizer,
-                                     active_instructions, registry=registry, no_memory=no_memory,
+                                     oai, _memory_mgr, _owner_mgr,
+                                     identity_store=_face_pipeline.store,
+                                     instructions=active_instructions, registry=registry,
+                                     no_memory=no_memory,
                                      face_pipeline=_face_pipeline, asd_engine=_asd_engine)
 
             conv = None

@@ -2,6 +2,26 @@
 
 ## 已完成事项
 
+### ✅ 身份系统统一 — 废弃 FaceDB，全切 IdentityStore(2026-07-09)
+
+两套并行的身份系统（旧 FaceDB→face_db.json vs 新 IdentityStore→gallery.json）导致同一个人在两个库中有不同条目和名字，命名/auto_merge/记忆归属全部失效。
+
+**统一改动**：
+- `identity/identity_store.py` — 补全 auto_merge/cross-person污染防护/verify_identity/backup_identity/set_name/线程安全save
+- `memory/manager.py` — `face_db` 参数改为 `identity_store`
+- `memory/safety.py` — `id_recognizer` 参数改为 `identity_store`，调用链全部对齐
+- `tools/base.py` — ToolDeps.id_recognizer → identity_store
+- `tools/memory.py` — 所有旧系统引用改为 identity_store
+- `voice/realtime.py` — try_name_identity/ChatCallback/RealtimeDialog 去掉 id_recognizer，统一 identity_store
+- `voice/d01_realtime_chat.py` — 删除 _id_recognizer 全局变量，直接实例化 ArcFaceONNX，MemoryManager/RealtimeDialog 传 identity_store=_face_pipeline.store
+
+**清理**：
+- `identity/recognizer.py` — 删除 FaceDB(250行)/IdentityRecognizer(100行)类，只保留 ArcFaceONNX/_align_face/_crop_face
+- `tests/test_identity.py` — 移除 FaceDB/IdentityRecognizer 测试，只保留 ArcFaceONNX+对齐测试
+- `scripts/recapture_face.py` — 改用 IdentityStore + gallery.json
+
+**验证**：py_compile 10/10 全通过
+
 ### ✅ 新增 turn_body 身体转向工具(2026-07-07)
 
 LLM 可调用 `turn_body(direction, angle)` 控制底盘旋转，大角度转向场景不再依赖手动内部逻辑。
@@ -247,7 +267,8 @@ perception/
   vision_worker.py — Face(YuNet/MediaPipe) + Hand(GestureRecognizer)
   fusion.py        — 声源-视觉融合
 identity/
-  recognizer.py    — ArcFace 身份识别 + auto_merge + startup_merged
+  recognizer.py    — ArcFaceONNX embedding 提取 + _align_face/_crop_face 工具函数
+  identity_store.py — IdentityStore 统一身份管理(gallery.json, 含 auto_merge/verify/backup)
   owner.py         — 主人认定
 memory/
   manager.py       — 认知记忆管理(Entity + Episodic + Working Memory)
@@ -312,7 +333,7 @@ memory/
    - 在多个文件散弹式添加工具相关代码
 
 运行时依赖注入:
-   ToolDeps(st, conv, motion_q, memory_mgr, owner_mgr, id_recognizer, face_pipeline)
+   ToolDeps(st, conv, motion_q, memory_mgr, owner_mgr, identity_store, face_pipeline)
    每次工具调用由分发层构建，工具内部通过 deps 访问所有资源
 
 工具分类:

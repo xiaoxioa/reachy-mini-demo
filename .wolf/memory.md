@@ -238,3 +238,11 @@
 | 当前 | voice/state.py: 新增 seek_person_request/result 字段 | voice/state.py | 跨线程通信 | ~200 |
 | 当前 | voice/d01_realtime_chat.py: behavior_loop 寻人 Stop-and-Check + 主循环结果回送 | voice/d01_realtime_chat.py | 完整搜索逻辑 | ~2k |
 | 当前 | py_compile 6/6 全绿 | — | 编译通过 | ~100 |
+| 09:00 | identity 统一: IdentityStore 补全 auto_merge/cross-person/verify/backup/set_name | identity/identity_store.py | 步骤1 完成 | ~1.5k |
+| 09:00 | MemoryManager 改用 identity_store 参数 | memory/manager.py | 步骤2 完成 | ~300 |
+| 09:00 | safety/tools 全部改用 identity_store | memory/safety.py, tools/base.py, tools/memory.py | 步骤3 完成 | ~500 |
+| 09:00 | realtime.py + d01 入口去掉旧系统, 改用 identity_store | voice/realtime.py, voice/d01_realtime_chat.py | 步骤4 完成 | ~1k |
+| 09:00 | 删除 FaceDB/IdentityRecognizer 类, 只保留 ArcFaceONNX/_align/_crop | identity/recognizer.py | 步骤5 清理 | ~500 |
+| 09:00 | test_identity.py 移除 FaceDB 测试, 只保留 ArcFaceONNX 测试 | tests/test_identity.py | 步骤5 清理 | ~300 |
+| 09:00 | recapture_face.py 改用 IdentityStore + gallery.json | scripts/recapture_face.py | 步骤5 清理 | ~300 |
+| 09:00 | py_compile 全 10 文件通过 | — | 编译验证 | ~100 |
